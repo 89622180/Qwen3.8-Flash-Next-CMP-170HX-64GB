@@ -4,7 +4,14 @@
 核心思路：**95.43 GiB 的 PLE/n-gram 表放 SSD（O_DIRECT 原生 Linux AIO，不进 RAM 也不进 ARC），主模型 47.05 GiB 常驻显存**。
 本文记录 2026-10-10 一天之内的调优全过程：冷 prefill 从 ~3,550 → ~3,500+（32k）、**200k 长上下文从 2,264 → ~3,525 tok/s（+56 %）、TTFT 从 88.5 s → ~56.5 s**，以及每一个被否决的方案（诚实版）。
 
-参考了 [jiangrun0213/strata-v100-notes](https://github.com/jiangrun0213/strata-v100-notes) 的记录风格。
+## 0. 来源与复现链（首版部署来源）
+
+首版部署完全按照 [klee100/Qwen3.8-Flash-Next-AutoRound-3bpw-MTP](https://huggingface.co/klee100/Qwen3.8-Flash-Next-AutoRound-3bpw-MTP) 模型卡的说明：
+
+- 引擎 = **上游 vLLM @ `a5a30471ff2bb7f0824f2da10e358af98d304472`** + [iIIusi0n/qwen3.8-flash-next-cmp170hx](https://github.com/iIIusi0n/qwen3.8-flash-next-cmp170hx) 的 [`patches/qwen38-ple-ssd.patch`](https://github.com/iIIusi0n/qwen3.8-flash-next-cmp170hx/blob/main/patches/qwen38-ple-ssd.patch)（55,767 B / 13 个文件：PLE 元数据加载、异步行读/预读、CUDA graph host breaks、混合位宽 expert 覆盖、MTP 层重映射），安装指南在 [docs/GUIDE.md](https://github.com/iIIusi0n/qwen3.8-flash-next-cmp170hx/blob/main/docs/GUIDE.md)。
+- 版本号 `0.29.1rc1.dev402+ga5a30471f.ple1` 的含义：上游 0.29.1rc1 之后 402 个提交（commit `a5a30471f`）+ ple-ssd 补丁的本地后缀 `.ple1`。
+- 作者参考数字（180 W / 企业 SATA / MTP=1 / 2K chunk）：8k prefill 2,636 tok/s、单请求 decode 111 tok/s、16 路聚合 667 tok/s。本仓库的优化把它推到（300 W / NVMe / MTP=2 / 3072 chunk）：32k ~3,500、C1 decode 124–153、C16 聚合 716–745。
+- **本仓库在其上叠加的改动**：全窗口预取补丁（`patches/ple_ssd-fullwindow.patch`，2 行）、多线程 AIO 读取器（`patches/ple_ssd_io_mt.c`，替代补丁里的单线程 `ple_ssd_io.c`）、`PLE_AIO_THREADS=32`、`QWEN_MTP=2`、chunk 3072、P-core 绑核、`bench.sh` 固定基准口径。
 
 ## 1. 背景：为什么这张卡能跑 125B
 
@@ -129,10 +136,18 @@ MTP acceptance 2.37–2.45 @ 69–73 %。decode 阶段盘 util 4 %——完全�
     └── mttest.py                    # .so 字节级等价性 + 速率 harness
 ```
 
-**复现步骤**（PVE LXC 内，vLLM ple1 fork 已装在 `/root/vllm`）：
+**复现步骤**：
 
 ```bash
-# 1. 打补丁（或直接 cp patches/ple_ssd.py 覆盖）
+# 0. 基础引擎（按作者指南，见第 0 节的链接）
+git clone https://github.com/vllm-project/vllm && cd vllm
+git checkout a5a30471ff2bb7f0824f2da10e358af98d304472
+curl -L -o /tmp/qwen38-ple-ssd.patch \
+  https://github.com/iIIusi0n/qwen3.8-flash-next-cmp170hx/raw/main/patches/qwen38-ple-ssd.patch
+git apply /tmp/qwen38-ple-ssd.patch
+# 按 docs/GUIDE.md 建 venv、编译 vllm 与原版 ple_ssd_io.so
+
+# 1. 打本仓库的全窗口补丁（或直接 cp patches/ple_ssd.py 覆盖）
 cd /root/vllm/src/vllm/models/qwen4_exp/nvidia/
 cp ple_ssd.py ple_ssd.py.orig
 patch -p1 < ple_ssd-fullwindow.patch   # 从仓库根目录: patch -p1 -d /root/vllm < patches/ple_ssd-fullwindow.patch
