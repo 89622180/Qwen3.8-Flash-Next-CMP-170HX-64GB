@@ -6,7 +6,7 @@
 
 ## 0. 来源与复现链（首版部署来源）
 
-首版部署完全按照 [klee100/Qwen3.8-Flash-Next-AutoRound-3bpw-MTP](https://huggingface.co/klee100/Qwen3.8-Flash-Next-AutoRound-3bpw-MTP) 模型卡的说明：
+首版是按 [iIIusi0n/qwen3.8-flash-next-cmp170hx](https://github.com/iIIusi0n/qwen3.8-flash-next-cmp170hx) 这个部署仓库搭建的，跑 [klee100/Qwen3.8-Flash-Next-AutoRound-3bpw-MTP](https://huggingface.co/klee100/Qwen3.8-Flash-Next-AutoRound-3bpw-MTP)（klee100 模型卡也指向同一个仓库）：
 
 - 引擎 = **上游 vLLM @ `a5a30471ff2bb7f0824f2da10e358af98d304472`** + [iIIusi0n/qwen3.8-flash-next-cmp170hx](https://github.com/iIIusi0n/qwen3.8-flash-next-cmp170hx) 的 [`patches/qwen38-ple-ssd.patch`](https://github.com/iIIusi0n/qwen3.8-flash-next-cmp170hx/blob/main/patches/qwen38-ple-ssd.patch)（55,767 B / 13 个文件：PLE 元数据加载、异步行读/预读、CUDA graph host breaks、混合位宽 expert 覆盖、MTP 层重映射），安装指南在 [docs/GUIDE.md](https://github.com/iIIusi0n/qwen3.8-flash-next-cmp170hx/blob/main/docs/GUIDE.md)。
 - 版本号 `0.29.1rc1.dev402+ga5a30471f.ple1` 的含义：上游 0.29.1rc1 之后 402 个提交（commit `a5a30471f`）+ ple-ssd 补丁的本地后缀 `.ple1`。
