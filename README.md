@@ -4,6 +4,42 @@
 核心思路：**95.43 GiB 的 PLE/n-gram 表放 SSD（O_DIRECT 原生 Linux AIO，不进 RAM 也不进 ARC），主模型 47.05 GiB 常驻显存**。
 本文记录 2026-10-10 一天之内的调优全过程：冷 prefill 从 ~3,550 → ~3,500+（32k）、**200k 长上下文从 2,264 → ~3,525 tok/s（+56 %）、TTFT 从 88.5 s → ~56.5 s**，以及每一个被否决的方案（诚实版）。
 
+## 对比一览：作者原版 vs 本仓库最终
+
+作者原版的公布值取自其部署仓库的 [`docs/RESULTS.md`](https://github.com/iIIusi0n/qwen3.8-flash-next-cmp170hx/blob/main/docs/RESULTS.md)（2026-09-19 测）；本仓库一列全部来自固定脚本 `bench.sh` / `decol.sh` 在 0.99 臂最后一轮的实测。
+
+| 指标 | 作者原版公布值 | **本仓库最终实测** | 变化 |
+|---|---:|---:|---|
+| prefill 512 | 1,616 tok/s | 未测（脚本不含该长度） | — |
+| prefill 2,048 | 1,915 tok/s | 未测 | — |
+| prefill 8,192 | 2,636 tok/s | **3,211**（3 轮中位；3,203/3,211/2,092） | **+22 %** |
+| prefill 32,768 | 2,132 tok/s | **3,536.0** | **+66 %** |
+| prefill 131,072 | 未测（文档只到 32K） | **3,628.7**（36.12 s） | 长度扩展 |
+| prefill 200,000 | 未测（原文：*"a full-length request was not tested"*） | **3,506.0**（TTFT 57.04 s） | 长度扩展 |
+| **prefill 随长度的衰减** | 8K→32K **掉 19 %**（2,636→2,132） | 8K→32K→200K **全程不掉速**（3,211 / 3,536 / 3,506） | **长度轴被抹平** |
+| C1 聚合 / 单流 decode | 103.30 / 110.99 | 117–143 / **124–153** | 聚合 +13~38 % · 单流 +12~38 % |
+| C4 聚合 / 单流 | 277.22 / 77.95 | 303–316 / 86–90 | 聚合 +9~14 % · 单流 +10~15 % |
+| C8 聚合 / 单流 | 428.97 / 60.63 | 464–531 / 68–77 | 聚合 +8~24 % · 单流 +12~27 % |
+| C16 聚合 / 单流 | 667.13 / 47.32 | 716–745 / 54–56 | 聚合 +7~12 % · 单流 +14~18 % |
+| TTFT C1 / C16 | 0.105 / 0.262 s | 0.07–0.08 / 0.17–0.18 s | −24~35 % |
+| KV 池 / 显存占用 | 未公布 | **372,215 tok**；63,596 / 65,536 MiB（util 0.99，剩 1,316 MiB） | 这是本卡的**实际上限**：util=1.00 会被引擎的启动门禁拒绝（torch 只见 63.39 GiB、启动前驱动已占 0.30 GiB），详见 2.5 |
+| MTP acceptance | 未公布（MTP=1） | 2.37–2.45 @ 69–73 %（第二 draft 位置命中 62 %） | — |
+
+**两边配置差（这才是上表差距的来源）**：
+
+| 项 | 作者原版 | 本仓库最终 |
+|---|---|---|
+| PLE 读 | 补丁内单线程 `ple_ssd_io.c` | 多线程 AIO（`patches/ple_ssd_io_mt.c`，`PLE_AIO_THREADS=32`） |
+| 预读窗口 | `16K prompt read-ahead` | **全窗口**（2 行补丁，覆盖整条剩余 prompt） |
+| chunk / MTP | 2048 / 1 | **3072 / 2** |
+| 显存 util | 0.96 | **0.99** |
+| CPU 绑核 | 无 | `CPUAffinity=0 3 4 6 8 10`（一个 P-core 一线程） |
+| 存储 | 企业级 **SATA** SSD，ZFS 默认 recordsize | **NVMe + `recordsize=4K`** 专用子数据集 |
+| RAM / ARC | 15 GiB RAM + 31 GiB swap，ARC 默认 | 62 GiB DDR4-3200 无 swap，`zfs_arc_max=8 GiB` |
+| 功耗上限 | **180 W** | 300 W（= `power.max_limit`） |
+
+> **读表须知：这张表不是同机 A/B。** 作者在 180 W + SATA + 15 GiB RAM 的参考机上测，我们在 300 W + NVMe(recordsize=4K) + 62 GiB RAM 的 CT120 上测——上表的一部分增益属于硬件（尤其 recordsize 与 SATA→NVMe），不属于代码。要剥离硬件看**纯改动收益**，看第 2 节那张同机同盘的当天基线表：**200k 2,264 → 3,506（+55 %）、TTFT 88.5 → 57.0 s**，每一步都是单变量 A/B。功耗那一行只是两边的客观差异：**本机实测 250 W→300 W 对这个工作负载的吞吐变化为零**（第 4 节），所以别把它当成可搬的优化项；显存/功耗上限怎么设由机主决定。
+
 ## 0. 来源与复现链（首版部署来源）
 
 首版是按 [iIIusi0n/qwen3.8-flash-next-cmp170hx](https://github.com/iIIusi0n/qwen3.8-flash-next-cmp170hx) 这个部署仓库搭建的，跑 [klee100/Qwen3.8-Flash-Next-AutoRound-3bpw-MTP](https://huggingface.co/klee100/Qwen3.8-Flash-Next-AutoRound-3bpw-MTP)（klee100 模型卡也指向同一个仓库）：
@@ -91,6 +127,30 @@ chunk 4096 单流更好（131k +5.7 %、200k +8.5 %），但 **C4 聚合掉 25 %
 
 **代价要说清**：剩 1,316 MiB 意味着这张卡上再起第二个进程已经无位置，且 CUDA 上下文的任何额外增长（更大 capture size、更长 ctx、KV 之外的临时缓冲）都会直接 OOM。这是「一台卡一个引擎、把显存全部换成 KV」的意图内取舍，不是漏配。
 
+**为什么不能直接 1.00（实测被拒，报错原文在这里很有价值）**：`--gpu-memory-utilization` 的校验是 `Field(default=0.92, gt=0, le=1)`，1.0 是合法值，但引擎在 `init_device` 阶段按「启动时空闲显存」设门禁，CT120 上读到的是 **63.09 GiB free / 63.39 GiB total**（torch 视角的卡是 63.39 GiB，不是 nvidia-smi 的 65,536 MiB——差的 0.30 GiB 在进程起来之前就被驱动占了）。所以：
+
+```
+ValueError: Free memory on device cuda:0 (63.09/63.39 GiB) on startup is
+less than desired GPU memory utilization (1.0, 63.39 GiB).
+Decrease GPU memory utilization or reduce GPU memory used by other processes.
+```
+
+**结论：这台机器上 util 的上限受「启动瞬间的空闲显存」支配。** torch 视角总量 63.39 GiB，本次干净启动时空闲 63.09 GiB ⇒ 理论上最大可用 util 是 63.09/63.39 ≈ 0.9953；但 **0.995 这一臂没有测成**（被我的 A/B 驱动脚本在 145 s 误判为启动失败而回退，而本机正常 boot 需要 ~290 s），所以「0.995 能不能跑」目前是**未验证**，不要当结论用。已验证的只有：`0.99` 可跑、`1.00` 必被上面那条 ValueError 挡死。
+
+**同一次误判回退还留下一个更值钱的观测**：脚本把 0.99 拉回来之后，引擎虽然 ready，但账目变了——`Free memory on device (62.8/63.39 GiB)`、`Available KV cache memory: 7.41 GiB`、`GPU KV cache size: 262,248 tokens`（对比干净启动的 63.09 / 10.53 GiB / 372,215）。空闲只差 0.29 GiB，KV 却少了 3.12 GiB，**说明有一次启动的「已消费显存」比另一次高约 2.8 GiB**，最可能是上一臂被 SIGKILL 后残留的 CUDA context 还没释放（systemd 当时确实报了 `Failed to kill control group … Input/output error`）。**含义：`util` 不是显存账的唯一自变量，重启前必须确认卡上没有残留 context，否则你会拿到一个「配置一样、KV 小 30 %」的引擎还以为改动生效了。** 这一轮随后在 131k prefill 处连接被拒（引擎掉线），我没有把它的任何数字写进上面的表。
+
+顺带一条引擎自己打印的换算，解释为什么「0.99 看起来只买了 2 GiB」：
+
+```
+CUDA graph memory profiling is enabled (default since v0.21.0).
+The current --gpu-memory-utilization=0.9900 is equivalent to
+--gpu-memory-utilization=0.9575 without CUDA graph memory profiling.
+```
+
+即 vLLM 现在会把 CUDA graph 的显存（实测 1.36 GiB，估算 2.06 GiB）**从 KV 预算里扣掉**，所以名义 util 和实际 KV 不是线性关系；想把这部分要回来，可用的开关是 `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`，或直接给 `--kv-cache-memory-bytes`（该值一旦设定就让 `gpu_memory_utilization` 失效，见 `config/cache.py:238-242`）。**这两个组合本仓库没有测过，属于「机制存在、收益未证」，别当成已验证的优化项照抄。**
+
+**引擎自己报的并发口径（journal 原文，可直接引用）**：`GPU KV cache size: 372,215 tokens, Maximum concurrency for 262,144 tokens per request: 1.42x`。
+
 
 ## 3. 深度速度基准（最终配置，全部来自固定脚本 `bench.sh` / `decol.sh` / `c4prefill.sh`）
 
@@ -140,7 +200,8 @@ MTP acceptance 2.37–2.45 @ 69–73 %。decode 阶段盘 util 4 %——完全�
 9. `pct snapshot` 对带 `mp0:` 挂载的 LXC 结构性拒绝（"snapshot feature is not available"）。
 10. 引擎自己的负载会把 loadavg 推到 7–28——**判断窗口干净要看外部 I/O（zpool 写入、未知进程），不是 loadavg 绝对值**。
 11. **`systemctl is-active` 要在容器里问**：同一 unit 名在 PVE 宿主上查会返回 `inactive`（unit 在 CT120 的 /etc 里，宿主 systemd 不认识），曾据此误判引擎掉了。用宿主侧 `nvidia-smi --query-compute-apps` 有 63,584 MiB 占用来反证引擎在跑，再进容器核对 MainPID==`:8000` 持有者。
-12. **想要 "+N GiB KV" 要按 `util × 64 GiB` 的差算，不是按百分比**：0.96→0.99 只把预算从 62,915 抬到 64,880 MiB（+1,965 MiB），所以 KV 最多加 ~2 GiB；0.96 出发能加的理论上限是 (1.00−0.96)×64 = 2.56 GiB，`util` 已经到顶了——再加 3 GiB KV 在这张卡上没有对应设置。
+12. **想要 "+N GiB KV" 要按 `util × 64 GiB` 的差算，不是按百分比**：0.96→0.99 只把预算从 62,915 抬到 64,880 MiB（+1,965 MiB），所以 KV 最多加 ~2 GiB；0.96 出发的理论上限是 (1.00−0.96)×64 = 2.56 GiB，而**实测能用的最高一档是 0.99**（1.00 被启动门禁拒绝，0.995 未验证——见 2.5），所以「再加 3 GiB KV」在这张卡上没有对应设置。
+13. **A/B 驱动的「启动失败」判定必须比引擎的真实 boot 时间长，且不能只看一次 `is-failed`**：本机 boot ≈290 s，我第一版驱动在 145 s 就误判失败并触发回退，把 0.995 那一臂白白废掉（结论变成未测）。正确写法：`systemctl reset-failed` 后轮询「MainPID 为空 **且** `is-failed=failed` 连续 3 次」，期限给到 800 s；SIGKILL 掉的引擎还会让 systemd 报 `Failed to kill control group … Input/output error`，紧接着重启就会读到残留 context 占的显存（见 2.5 里那次 KV 缩水 3.12 GiB 的观测）。
 
 ## 6. 文件说明与复现
 
