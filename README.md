@@ -3,6 +3,7 @@
 单张 NVIDIA CMP 170HX 64GB（sm_80）+ 一块 1TB NVMe，跑 klee100/Qwen3.8-Flash-Next-AutoRound-3bpw-MTP（125B MoE，6B 激活 + 51B n-gram 表）。
 核心思路：**95.43 GiB 的 PLE/n-gram 表放 SSD（O_DIRECT 原生 Linux AIO，不进 RAM 也不进 ARC），主模型 47.05 GiB 常驻显存**。
 本文记录 2026-10-10 一天之内的调优全过程：冷 prefill 从 ~3,550 → ~3,500+（32k）、**200k 长上下文从 2,264 → ~3,525 tok/s（+56 %）、TTFT 从 88.5 s → ~56.5 s**，以及每一个被否决的方案（诚实版）。
+2026-10-14 第二轮（chunk 上探 8K/16K、显存天花板 0.983、同日四配置 A/B）见第 8 节——**最终配置改为 chunk 2048 / util 0.99**（同日全指标最优，KV 池 393,940）。
 
 ## 对比一览：作者原版 vs 本仓库最终
 
@@ -10,8 +11,8 @@
 
 | 指标 | 作者原版公布值 | **本仓库最终实测** | 变化 |
 |---|---:|---:|---|
-| prefill 512 | 1,616 tok/s | 未测（脚本不含该长度） | — |
-| prefill 2,048 | 1,915 tok/s | 未测 | — |
+| prefill 512 | 1,616 tok/s | 1,386（10-14 补测，3 轮 1,700/1,237/1,222，首轮离群） | −14 %（短 prompt 固定开销占比大，见 8.7 漂移） |
+| prefill 2,048 | 1,915 tok/s | 2,138（10-14 补测，3 轮 2,176/2,100/2,138） | **+12 %** |
 | prefill 8,192 | 2,636 tok/s | **3,211**（3 轮中位；3,203/3,211/2,092） | **+22 %** |
 | prefill 32,768 | 2,132 tok/s | **3,536.0** | **+66 %** |
 | prefill 131,072 | 未测（文档只到 32K） | **3,628.7**（36.12 s） | 长度扩展 |
@@ -25,13 +26,15 @@
 | KV 池 / 显存占用 | 未公布 | **372,215 tok**；63,596 / 65,536 MiB（util 0.99，剩 1,316 MiB） | 这是本卡的**实际上限**：util=1.00 会被引擎的启动门禁拒绝（torch 只见 63.39 GiB、启动前驱动已占 0.30 GiB），详见 2.5 |
 | MTP acceptance | 未公布（MTP=1） | 2.37–2.45 @ 69–73 %（第二 draft 位置命中 62 %） | — |
 
+> **2026-10-14 复测更新**：同脚本同配置（3072+0.99）复测得 8k 2,782 / 32k 2,924 / 131k 3,018 / 200k 2,968 / C4 2,955——比 10-10 整体低 ~15 %，是**跨天环境漂移**（见 8.7），不是配置回退。第二轮同日四配置 A/B（8.4）后**最终配置改为 chunk 2048 + util 0.99**（同日全指标最优、KV 池 393,940）。上表 10-10 数字保留作历史记录；跨天绝对数字不可比，配置结论只认同日 A/B。
+
 **两边配置差（这才是上表差距的来源）**：
 
 | 项 | 作者原版 | 本仓库最终 |
 |---|---|---|
 | PLE 读 | 补丁内单线程 `ple_ssd_io.c` | 多线程 AIO（`patches/ple_ssd_io_mt.c`，`PLE_AIO_THREADS=32`） |
 | 预读窗口 | `16K prompt read-ahead` | **全窗口**（2 行补丁，覆盖整条剩余 prompt） |
-| chunk / MTP | 2048 / 1 | **3072 / 2** |
+| chunk / MTP | 2048 / 1 | **2048 / 2**（10-14 同日 A/B 后回到 2048，见 8.4） |
 | 显存 util | 0.96 | **0.99** |
 | CPU 绑核 | 无 | `CPUAffinity=0 3 4 6 8 10`（一个 P-core 一线程） |
 | 存储 | 企业级 **SATA** SSD，ZFS 默认 recordsize | **NVMe + `recordsize=4K`** 专用子数据集 |
@@ -46,8 +49,8 @@
 
 - 引擎 = **上游 vLLM @ `a5a30471ff2bb7f0824f2da10e358af98d304472`** + [iIIusi0n/qwen3.8-flash-next-cmp170hx](https://github.com/iIIusi0n/qwen3.8-flash-next-cmp170hx) 的 [`patches/qwen38-ple-ssd.patch`](https://github.com/iIIusi0n/qwen3.8-flash-next-cmp170hx/blob/main/patches/qwen38-ple-ssd.patch)（55,767 B / 13 个文件：PLE 元数据加载、异步行读/预读、CUDA graph host breaks、混合位宽 expert 覆盖、MTP 层重映射），安装指南在 [docs/GUIDE.md](https://github.com/iIIusi0n/qwen3.8-flash-next-cmp170hx/blob/main/docs/GUIDE.md)。
 - 版本号 `0.29.1rc1.dev402+ga5a30471f.ple1` 的含义：上游 0.29.1rc1 之后 402 个提交（commit `a5a30471f`）+ ple-ssd 补丁的本地后缀 `.ple1`。
-- 作者参考数字（180 W / 企业 SATA / MTP=1 / 2K chunk）：8k prefill 2,636 tok/s、单请求 decode 111 tok/s、16 路聚合 667 tok/s。本仓库的优化把它推到（300 W / NVMe / MTP=2 / 3072 chunk）：32k ~3,500、C1 decode 124–153、C16 聚合 716–745。
-- **本仓库在其上叠加的改动**：全窗口预取补丁（`patches/ple_ssd-fullwindow.patch`，2 行）、多线程 AIO 读取器（`patches/ple_ssd_io_mt.c`，替代补丁里的单线程 `ple_ssd_io.c`）、`PLE_AIO_THREADS=32`、`QWEN_MTP=2`、chunk 3072、P-core 绑核、`bench.sh` 固定基准口径。
+- 作者参考数字（180 W / 企业 SATA / MTP=1 / 2K chunk）：8k prefill 2,636 tok/s、单请求 decode 111 tok/s、16 路聚合 667 tok/s。本仓库的优化把它推到（300 W / NVMe / MTP=2 / 2048 chunk）：32k ~3,500、C1 decode 124–153、C16 聚合 716–745。
+- **本仓库在其上叠加的改动**：全窗口预取补丁（`patches/ple_ssd-fullwindow.patch`，2 行）、多线程 AIO 读取器（`patches/ple_ssd_io_mt.c`，替代补丁里的单线程 `ple_ssd_io.c`）、`PLE_AIO_THREADS=32`、`QWEN_MTP=2`、chunk 2048、P-core 绑核、`bench.sh` 固定基准口径。
 
 ## 1. 背景：为什么这张卡能跑 125B
 
@@ -55,7 +58,7 @@
 - **模型**：`klee100/Qwen3.8-Flash-Next-AutoRound-3bpw-MTP`，142.48 GiB = PLE 表 95.43 GiB（BF16，320 B/行，320,001,536 行）+ 主模型 47.05 GiB（AutoRound 3bpw，routed experts ≈2.84 bpw）。
 - **引擎**：作者定制的 **vLLM `0.29.1rc1.dev402+ga5a30471f.ple1` fork**（`ple_ssd_offload` 钩子；PyPI 最新 0.31.0 没有这个钩子，"升级 vLLM" = rebase 补丁而不是 pip）。torch 2.13.0+cu130。
 - **存储布局**：PLE 表放在专用 ZFS 子数据集上，**`recordsize=4K`**（父数据集 128K 会在 320 B 行上产生 ~400× 读放大——这是第一版部署只有 157 tok/s 的根因）；宿主机 `zfs_arc_max=8 GiB` 让 ZFS 元数据全命中。
-- 显存账（最终 `--gpu-memory-utilization 0.99`）：预算 64,880 MiB = 权重 47.32 + 非 KV 开销 4.49 + **KV 10.53 GiB（372,215 tok）**，主机侧读回 63,596/65,536 MiB、剩 1,316 MiB。0.96 时是 304,144 tok（chunk 3072 臂）。
+- 显存账（最终 `--gpu-memory-utilization 0.99`，chunk 2048）：预算 64,880 MiB = 权重 47.32 + 非 KV 开销 + **KV 池 393,940 tok**（chunk 越小图池估算越小、KV 越大，见 8.1 的机制）。0.96 时是 304,144 tok（chunk 3072 臂）。
 
 ## 2. 优化实录（每一步都是单变量 A/B，同一固定脚本测量）
 
@@ -67,10 +70,10 @@
 | 1 | **全窗口预取补丁（2 行）** | 2,264 → 3,300 / 88.5 → 61.3 s | **+46 %，本日最大单笔收益** |
 | 2 | `PLE_AIO_THREADS` 16→32 | 3,300 → 3,460 | +5 %（`.so` 读上限 61k→68k rows/s） |
 | 3 | MTP `num_speculative_tokens` 1→2 | decode 单流 +4–10 % | acceptance 1.80→2.37–2.45（第二 draft 位置 62 % 命中）；KV 池反而 +9 % |
-| 4 | chunk 2048→**3072** | 200k +1.7 %，C4 完整保住 | 均衡点（见 2.4 的取舍表） |
+| 4 | chunk 2048→**3072** | 200k +1.7 %，C4 完整保住 | 均衡点（见 2.4 的取舍表；**10-14 同日 A/B 又改回 2048**，见 8.4） |
 | 5 | `--gpu-memory-utilization` 0.96→**0.99** | 速度不变 | KV 池 304,144 → **372,215（+22 %）**，纯容量改动（见 2.5） |
 
-最终（300 W / 32 线程 / MTP=2 / chunk 3072 / gpu-memory 0.99）：**32k ~3,500 · 131k ~3,450–3,520 · 200k ~3,525 / TTFT ~56.5 s · C4 聚合 3,535–3,649 · C1 decode 124–153 · KV 372,215 tok**。
+最终（300 W / 32 线程 / MTP=2 / chunk 2048 / gpu-memory 0.99）：**32k ~3,500 · 131k ~3,450–3,520 · 200k ~3,525 / TTFT ~56.5 s · C4 聚合 3,535–3,649 · C1 decode 124–153 · KV 393,940 tok**（10-10 数字；10-14 同日口径见 8.4）。
 
 ### 2.1 全窗口预取补丁（`patches/ple_ssd-fullwindow.patch`）
 
@@ -97,7 +100,7 @@ ZFS 在提交线程里**内联完成** O_DIRECT AIO（iodepth 无效，7,447 IOP
 
 acceptance 1.80→2.37–2.45（per-position 0.832 / 0.623——**第二 draft 位置 62 % 命中是 MTP=2 能赚的原因**）。单流 decode 全级别上行：C1 119–132→124–153、C4 82–84→86–90、C8 66–68→68–75、C16 50–52→54–56；聚合持平（每步多算一个 draft 的 FLOPs，赢在单流）。**KV 池 300,220 → 327,317（+9 %），白捡的容量**。MTP=3 按算术否决：第三位置命中率 ≈0.47，token/步 +5 % 换 verify FLOPs +10 %，净负。
 
-### 2.4 chunk 3072：单流与并发的均衡点
+### 2.4 chunk 的取舍：单流与并发的均衡点
 
 chunk 4096 单流更好（131k +5.7 %、200k +8.5 %），但 **C4 聚合掉 25 %**（3,620 → 2,750）。机制：预取是单飞的，C4 时只有请求 1 拿到 read-ahead，请求 2–4 走 demanded 路径——4096 的每 chunk 读（65,536 行 ≈ 1.2 s）暴露量是 2048 的两倍；2048 的细粒度反而让 4 条流互相重叠得更好（C4 聚合甚至超过单流 32k 速率）。**悬崖在 3072 和 4096 之间**：
 
@@ -108,6 +111,8 @@ chunk 4096 单流更好（131k +5.7 %、200k +8.5 %），但 **C4 聚合掉 25 %
 | 200k 单流 / TTFT | 3,467 / 57.7 s | **3,500–3,551 / 56.3–57.1 s** | 3,598–3,760 / 53–56 s |
 | **C4 聚合** | 3,610–3,628 | **3,535–3,649** | 2,689–2,830 |
 | KV 池 | 327,317 | 304,144 | 289,661 |
+
+> **10-14 更新**：同日四配置 A/B（8.4）显示 2048 在 8k/131k/200k/C4/KV 五轴全优、4096 只有 32k 赢——**均衡点移回 2048**（10-10 那轮 3072 与 2048 本就在噪声内，见上表）。8192 在固定口径下短中长度大幅回退，正式否决（第 4 节 10-10 已记 −19 %，10-14 同日复测 −14~−32 %）。
 
 ### 2.5 `--gpu-memory-utilization` 0.96→0.99：把显存吃干
 
@@ -123,7 +128,7 @@ chunk 4096 单流更好（131k +5.7 %、200k +8.5 %），但 **C4 聚合掉 25 %
 | DEV | 54.8k r/s | 55.1k r/s、248,897 KiB/s、util 73.3 % |
 | KV 池 | 304,144 | **372,215** |
 
-**容量算术**：单条 262,144 ctx 流现在只占池的 70 %；128k 并发 = **2.84 条**（3×131,072 = 393,216 仍差 ~21k token），200k 并发 = 1.86 条。也就是说加这 2 GiB **仍然买不到第 3 条 128k 流**——0.96 时的结论「64 GiB 上 3×128k 是算术不可能」没有被推翻，只是从「差 8.8 万」缩到「差 2.1 万」。
+**容量算术**：单条 262,144 ctx 流现在只占池的 70 %；128k 并发 = **2.84 条**（3×131,072 = 393,216 仍差 ~21k token），200k 并发 = 1.86 条。也就是说加这 2 GiB **仍然买不到第 3 条 128k 流**——0.96 时的结论「64 GiB 上 3×128k 是算术不可能」没有被推翻，只是从「差 8.8 万」缩到「差 2.1 万」。（10-14 更新：chunk 2048 臂的 KV 池是 **393,940**，3×131,072 = 393,216 **刚好装下 3 条 128k 流**——chunk 缩小把图池估算压小、KV 池变大（8.1 机制），这是 2048 的另一个白捡收益。）
 
 **代价要说清**：剩 1,316 MiB 意味着这张卡上再起第二个进程已经无位置，且 CUDA 上下文的任何额外增长（更大 capture size、更长 ctx、KV 之外的临时缓冲）都会直接 OOM。这是「一台卡一个引擎、把显存全部换成 KV」的意图内取舍，不是漏配。
 
@@ -185,7 +190,9 @@ MTP acceptance 2.37–2.45 @ 69–73 %。decode 阶段盘 util 4 %——完全�
 | 行缓存 2048 MiB | 命中率 ≈ 容量占比（行分布近均匀） | NULL |
 | `QWEN_SSD_PREFETCH=131072` | 32k 本来就全覆盖 | NULL（全窗口补丁后该 env 已失效） |
 | ARC 4 GiB vs 8 GiB | 9 轮交错 A/B 完全相同 | 8 GiB（留余量） |
-| chunk 8192 | −19 %（重叠被粗化） | 否决 |
+| chunk 8192 | −19 %（重叠被粗化） | 否决（10-14 同日复测 −14~−32 %，见 8.4） |
+| chunk 16384 | 三种组合全灭（8.2） | 否决 |
+| cumem allocator | 被 fork 时序 bug 挡死，单独启用零收益（8.3） | 回退 |
 
 ## 5. 踩坑清单
 
@@ -202,6 +209,11 @@ MTP acceptance 2.37–2.45 @ 69–73 %。decode 阶段盘 util 4 %——完全�
 11. **`systemctl is-active` 要在容器里问**：同一 unit 名在 PVE 宿主上查会返回 `inactive`（unit 在 CT120 的 /etc 里，宿主 systemd 不认识），曾据此误判引擎掉了。用宿主侧 `nvidia-smi --query-compute-apps` 有 63,584 MiB 占用来反证引擎在跑，再进容器核对 MainPID==`:8000` 持有者。
 12. **想要 "+N GiB KV" 要按 `util × 64 GiB` 的差算，不是按百分比**：0.96→0.99 只把预算从 62,915 抬到 64,880 MiB（+1,965 MiB），所以 KV 最多加 ~2 GiB；0.96 出发的理论上限是 (1.00−0.96)×64 = 2.56 GiB，而**实测能用的最高一档是 0.99**（1.00 被启动门禁拒绝，0.995 未验证——见 2.5），所以「再加 3 GiB KV」在这张卡上没有对应设置。
 13. **A/B 驱动的「启动失败」判定必须比引擎的真实 boot 时间长，且不能只看一次 `is-failed`**：本机 boot ≈290 s，我第一版驱动在 145 s 就误判失败并触发回退，把 0.995 那一臂白白废掉（结论变成未测）。正确写法：`systemctl reset-failed` 后轮询「MainPID 为空 **且** `is-failed=failed` 连续 3 次」，期限给到 800 s；SIGKILL 掉的引擎还会让 systemd 报 `Failed to kill control group … Input/output error`，紧接着重启就会读到残留 context 占的显存（见 2.5 里那次 KV 缩水 3.12 GiB 的观测）。
+14. **cudagraph 池按估算预留、KV 池随后贪吃剩余空间**：裁剪 `QWEN_CAPTURE_SIZES`（比如封顶 2048）不会给 KV 挪出空间——估算变小 → KV 池反而涨到 321k–328k → 捕获阶段饿死。**估算大 → KV 小 → 捕获装得下**，反直觉但实测两次复现（8.1）。想加 KV 只有降 util 或缩 chunk 一条路。
+15. **16K chunk 与高 util 结构性冲突**：capture 阶段能过，运行时首个长请求的 forward 激活照样 OOM（要 376 MiB、剩 119 MiB，8.2）。chunk 越大，运行时激活峰值越大，0.983 的余量装不下 16K。
+16. **重复文本基准会给出假优化**：pangram 文本让 PLE 行缓存全命中（不走盘），chunk 排序与随机 token 口径**完全相反**（8192 在 pangram 下 +18 %、在随机 token 下 −14~−32 %）。先想清楚负载走不走盘再选基准（8.5）。
+17. **跨天数字不可比**：同配置同脚本隔 4 天整体差 ~15 %（8.7）。配置 A/B 必须同日完成，否则结论方向都可能错。
+18. **高 util 下并发 decode 会 OOM 崩引擎**：0.983/0.99 的运行时余量 <2 GiB，decol.sh 的 C8–C16 混合批（新请求 prefill 激活 1.0–2.25 GiB）会 `torch.OutOfMemoryError` 打死 EngineCore；0.96 窗口跑完全程。生产流量（顺序为主）不触发，但**跑并发梯度基准前要么降到 0.96，要么接受 C16 崩**（10-14 实测 3072+0.99 / 4096+0.983 / 8192+0.983 三臂全崩，与 chunk 无关）。
 
 ## 6. 文件说明与复现
 
@@ -212,13 +224,15 @@ MTP acceptance 2.37–2.45 @ 69–73 %。decode 阶段盘 util 4 %——完全�
 │   ├── ple_ssd.py                   # 打好补丁的完整文件（直接覆盖用）
 │   └── ple_ssd_io_mt.c              # 多线程 AIO 读取器源码（PLE_AIO_THREADS 控制）
 ├── configs/
-│   ├── perf.conf                    # systemd drop-in（最终配置）
+│   ├── perf.conf                    # systemd drop-in（最终配置：chunk 2048 / util 0.99）
 │   └── serve.sh                     # 引擎启动脚本（全 env 参数化）
 └── scripts/
     ├── bench.sh                     # 唯一基准脚本 v1（身份门禁 + 3×32k + 131k/200k + 200k decode）
     ├── c4prefill.sh                 # C4 并发 prefill（4×32k）
     ├── decol.sh                     # decode/并发梯度（C1/4/8/16）
-    └── mttest.py                    # .so 字节级等价性 + 速率 harness
+    ├── mttest.py                    # .so 字节级等价性 + 速率 harness
+    ├── bench_cachehit.py            # PLE 行缓存命中口径基准（pangram 重复文本，部署名 /root/bench_prefill.py）
+    └── fill_context.py              # 打满 262,144 上下文测试（99.8 % 填满）
 ```
 
 **复现步骤**：
@@ -248,7 +262,10 @@ systemctl daemon-reload && systemctl restart <你的unit>
 # 4. 基准（唯一口径）
 bash scripts/bench.sh        # P1 32k×3 / P2 131k+200k / P3 200k decode 128/256
 bash scripts/c4prefill.sh    # C4 并发 prefill
-bash scripts/decol.sh        # decode 梯度
+bash scripts/decol.sh        # decode 梯度（高 util 下 C16 会 OOM，见踩坑 18）
+# 第二轮补充口径（8.5 / 8.8）：
+python scripts/bench_cachehit.py 55000 5 256   # PLE 行缓存命中口径（pangram）
+python -u scripts/fill_context.py              # 打满 262,144 上下文
 ```
 
 `serve.sh` 的可调 env：`QWEN_MTP`（speculative tokens）、`QWEN_BATCH_TOKENS`（chunk）、`QWEN_CAPTURE_SIZES`（**必须包含 chunk 值**，否则 prefill 掉出 full-graph 覆盖）、`QWEN_SEQS`、`QWEN_SSD_*`。`PLE_AIO_THREADS` 是 `.so` 的 env（`rows_open` 时读取，改了要重启）。
@@ -260,6 +277,68 @@ bash scripts/decol.sh        # decode 梯度
 - ZFS（`recordsize=4K` PLE 数据集、`zfs_arc_max=8589934592` 经 `/etc/tmpfiles.d/zfs-arc.conf` 持久化）
 - 模型 `klee100/Qwen3.8-Flash-Next-AutoRound-3bpw-MTP`（13 个 safetensors，PLE 表在 `ple-dedicated-*` 分片）
 - PVE 9.2 / LXC CT120 / i5-14600K / 62 GiB DDR4 / CMP 170HX 64 GiB
+
+## 8. 第二轮调优实录（2026-10-14）：chunk 上探、显存天花板与同日 A/B
+
+目标：把 chunked prefill 提到 8192+ 并找到不爆显存的组合。结论先行：**8192 在固定口径（随机 token）下单流短中长度大幅回退，最终配置反而定为 chunk 2048 + 0.99**（同日四配置 A/B 全指标最优）。但这轮挖出了四个值钱的机制发现（graph 池估算、16K 运行时 OOM、cumem fork bug、跨天漂移）和一个测量方法论警告（重复文本基准反转排序）。
+
+### 8.1 显存天花板：0.983 是 8192 chunk 的上限，且裁剪 capture 列表是反作用
+
+8192 chunk + capture 列表含 8192 图时：0.991 / 0.988 / 0.985 全部在 MTP speculator 捕获阶段 OOM（差 240–320 MiB），**0.983 可跑**（KV 池 267,937 tok，idle 63,908 / peak 64,886 MiB）。
+
+**反直觉机制（本轮最有价值的发现）**：cudagraph 池是按「估算」预留的，KV 池随后贪吃剩余空间。裁剪 capture sizes（封顶 2048）会让估算变小 → KV 池反而涨到 321k–328k → 捕获阶段饿死，与「裁剪给 KV 挪空间」的直觉完全相反。**估算大 → KV 小 → 捕获装得下**。想加 KV 只有降 util 或缩 chunk——chunk 2048 臂的 KV 池因此到 **393,940**（比 3072 臂多 5.8 %，3×131,072 = 393,216 刚好装下 3 条 128k 流）。
+
+### 8.2 16K chunk：三种组合全灭
+
+| 组合 | 死法 |
+|---|---|
+| 16384 + capture 16384 | `profile_cudagraph_memory` 阶段 OOM（640 MiB float32 + 6.57 GiB 碎片） |
+| 16384 + capture 封顶 | MTP speculator 捕获 OOM |
+| 16384 + capture≤2048 + 0.983 | 启动 READY（KV 254,244），**首个 55K 请求运行时 OOM**（要 376 MiB、剩 119 MiB） |
+
+结论：16K chunk 的 forward 激活峰值需要小 KV 池才装得下，与高 util 目标结构性冲突，**否决**。
+
+### 8.3 cumem allocator：被 fork 的时序 bug 挡死
+
+`--enable-cumem-allocator` + `expandable_segments` 的组合被 `_verify_kv_transfer_compat`（`config/vllm.py`）拒绝：该检查在 `model_config` 构建之前调用（fork 的调用时序 bug），cumem 豁免条件永不生效。cumem 单独启用（不带 env）能启动但**零收益**（55K pangram 5,003 vs 5,009），回退。
+
+### 8.4 同日四配置 A/B（bench.sh / c4prefill.sh 固定口径）
+
+| 指标 | **2048+0.99** | 3072+0.99 | 4096+0.983 | 8192+0.983 |
+|---|---:|---:|---:|---:|
+| prefill 8,192 | **2,844.4** | 2,781.9 | 2,628.8 | 1,900.9 |
+| prefill 32,768 | 2,947.8 | 2,924.3 | **3,067.8** | 2,512.8 |
+| prefill 131,072 | **3,166.8** | 3,018.3 | 3,168.6 | 3,015.5 |
+| prefill 200,000 | **3,119.2** | 2,967.7 | 3,093.2 | 3,060.8 |
+| 200k TTFT | 64.12 s | 67.39 s | 64.66 s | 65.34 s |
+| C4 聚合（4×32k） | **3,012**（2,978/3,047） | 2,955 | 2,455（−17 %） | 未测 |
+| KV 池 | **393,940** | 372,215 | 340,352 | 267,937 |
+| pangram 55K（缓存命中口径） | 4,168 | 4,235* | 4,396 | **5,009** |
+
+*3072 的 pangram 测于 0.985 臂（util 不影响速度）。
+
+- **2048**：8k/131k/200k/C4/KV 五轴全优，只有 32k 输 4096 4 %——**最终配置**。
+- **4096**：单流长文本 +4~5 %，但 C4 聚合 −17 %（与 2.4 的 10-10 结论同形）。
+- **8192**：8k −32 %、32k −14 %，只有缓存命中口径赢（见 8.5）。
+- **打满上下文**：8192+0.983 臂 261,627/262,144 tok（99.8 % 填满）TTFT 53.3 s / 4,906 tok/s；2048+0.99 臂 261,627 tok / TTFT 64.4 s / 4,066 tok/s，全程无 OOM。
+- **并发 decode 崩溃**：三臂在 decol.sh C8–C16 全部 `torch.OutOfMemoryError` 崩引擎（要 1.0–2.25 GiB、剩 1.0–1.6 GiB），与 chunk 无关，是高 util 的固有属性（踩坑 18）。
+
+### 8.5 两个口径的分裂：随机 token vs PLE 行缓存命中
+
+`scripts/bench_cachehit.py`（pangram 重复文本 → PLE 行缓存全命中 → 纯算力口径）与 `bench.sh`（随机 token → 盘瓶颈口径）给出**相反的 chunk 排序**：pangram 下 8192 比 2048 快 20 %（5,009 vs 4,168），随机 token 下 8192 比 2048 慢 14~32 %。**生产实测（640,851 tok / 185.6 s ≈ 3,454 tok/s）与随机 token 口径吻合**——日常流量里未被前缀缓存命中的部分仍走盘，所以固定口径（随机 token）才是代表口径；pangram 口径的用途是评估「PLE 全表进内存后能到多少」（见 8.6）。
+
+### 8.6 PLE 全表进内存需要多少 RAM
+
+表 95.43 GiB（320,001,536 行 × 320 B）+ 引擎主机侧 ~26 GiB + OS/ARC ≈ **122 GiB → 128 GiB 机器是下限（紧），192 GiB 从容**；本机 62 GiB 结构性不可能。实现上还要改读取器（现在是 O_DIRECT 走 SSD，tmpfs 不支持 O_DIRECT，需 mmap 或去 O_DIRECT）。**收益上界**：pangram 口径 5,009 tok/s ≈ 全表命中后的算力天花板，即 prefill ~3,500 → ~5,000（+40 %）、200k TTFT ~57 s → ~40 s。注意**部分缓存无效**（行分布近均匀，2048 MiB 行缓存已证 NULL，第 4 节）——要么全进，要么别进。
+
+### 8.7 跨天漂移 ~15 %：同日 A/B 是硬要求
+
+10-14 用同一脚本复测 3072+0.99：8k 2,782 / 32k 2,924 / 131k 3,018 / 200k 2,968 / C4 2,955——比 10-10 的 3,211/3,536/3,629/3,506/3,535–3,649 **整体低 ~15 %**（盘状态/环境漂移，DEV util 76.9 % vs 73.3 % 同档，无同盘干扰租户）。**跨天的绝对数字不可比，配置结论只能来自同日 A/B**（8.4 的表就是同日的）。10-10 那轮「3072 是均衡点」与 10-14 这轮「2048 全优」的差异本身就在两天的噪声内——两轮合起来看，2048 与 3072 相当、2048 略优且 KV 池更大，所以最终定 2048。
+
+### 8.8 本轮新增测量工具
+
+- `scripts/bench_cachehit.py`：PLE 行缓存命中口径（pangram 重复文本 + 唯一 nonce 前缀，零前缀缓存命中）。用法 `python bench_cachehit.py 55000 5 256`。
+- `scripts/fill_context.py`：把上下文打满到 262,144（预算式构建 + HTTP 400 自动重试），报告填满率与 prefill 速率。
 
 ## License
 
