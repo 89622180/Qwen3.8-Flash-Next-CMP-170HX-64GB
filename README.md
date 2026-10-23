@@ -489,7 +489,9 @@ decode ~100–108 tok/s（单流）；EngineCore RssAnon 13.3 GiB；80K 单请�
 | 200K prefill（d200k 口径） | 2,897 tok/s | 2,898 tok/s | 持平 |
 | 200K decode 128 tok（单流） | **173.6 tok/s** | **184.2 tok/s** | **0.32 快 ~6%** |
 
-结论：prefill 两版持平（262K 略慢但在单次样本噪声内），**decode 0.32.0 快约 6%**（推测来自上游调度/采样路径的常规优化）。0.32.0 移植版功能完整可用，但暂不替换生产——0.29 生产稳定运行中，切换收益仅 decode 6%，待长期观察后再定。
+结论：prefill 两版持平（262K 略慢但在单次样本噪声内），**decode 0.32.0 快约 6%**（推测来自上游调度/采样路径的常规优化）。
+
+**2026-10-23 已切换生产到 0.32.0**：`systemctl stop/disable qwen38-3bpw-ple-ssd` + `enable/start qwen38-032-test`（同端口 8000，互斥；0.29 服务单元保留可随时回滚）。
 
 ## License
 
