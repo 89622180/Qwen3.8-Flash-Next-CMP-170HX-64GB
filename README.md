@@ -493,6 +493,23 @@ decode ~100–108 tok/s（单流）；EngineCore RssAnon 13.3 GiB；80K 单请�
 
 **2026-10-23 已切换生产到 0.32.0**：`systemctl stop/disable qwen38-3bpw-ple-ssd` + `enable/start qwen38-032-test`（同端口 8000，互斥；0.29 服务单元保留可随时回滚）。
 
+### 10.3 0.32 新特性逐项优化实验（2026-10-23，切换生产后）
+
+按性价比顺序对 0.32 新特性逐项实测（每项独立开关 + 重启 + A/B，seed 轮换防前缀缓存干扰）：
+
+| # | 实验 | 结果 | 处置 |
+|---|------|------|------|
+| 1 | KV CPU offload 8GB 是否复活（6×80K 挤出驱逐后重发） | **仍是死容量**：重发 28.5s ≈ 首次 28.1s，`external_prefix_cache_hits_total=0`（0.32 新增的细粒度 boundary offload 路径未生效） | **砍掉 `QWEN_KV_CPU_GB=8`**，省 8GB host RAM；`--prefix-match-unit 8` 拆出独立传；回归无损失（80K 27.9s / 200K 70.1s / decode seed 方差带内 168-193 tok/s） |
+| 2 | `--enable-mamba-shared-prefix-checkpoint`（MTP sibling 交汇处注册 mamba 检查点） | 分叉场景（共享 60K 前缀+不同尾）：开/关都 0 命中；superset 场景（req2=req1 全文+追加）：开/关都命中 59,992 tokens、1.2s vs 21s——**17 倍加速是 0.32 基础能力（replay_boundaries + 8-token 细粒度哈希），flag 无增益** | 保持关闭（`QWEN_MAMBA_SHARED_PREFIX=0`） |
+| 3 | `QWEN_GPU_MEMORY` 0.995→1.0 | **启动即被拒**：设备空闲 63.09/63.39 GiB < 1.0×63.39，0.995 已是实际安全上限 | 回滚 0.995 |
+| 4 | `--prefix-caching-hash-algo xxhash`（uv 装 xxhash 4.0.2） | prefill 持平（27.9/70.0s），decode 在 seed 方差带内；无实测收益但调度器哈希 CPU 开销理论更低 | **保留**（`QWEN_HASH_ALGO=xxhash`） |
+| 5 | flashinfer-jit-cache 0.7.0.post1+cu130（`vllm download-kernels`） | **网络阻断**：flashinfer.ai 索引可达但 uv 静默不装；wheel 在 GitHub releases，PVE 直连停滞 4.5KB、socks5 代理 000；且收益本就边际（采样已用 FlashInfer、attention 走 FLASH_ATTN、sm80 不触发 Hopper 警告） | 放弃 |
+| 6 | `QWEN_ASYNC_SCHED=1` 异步调度 | prefill 慢 2-3%（80K 28.6s / 200K 72.4s），decode 无增益（165.8/182.0/192.4，方差带内）；**且引擎在启动 4 分钟后无请求状态下静默死亡一次**（无 Python 堆栈，疑似原生层崩溃，与 PLE AIO 32 线程冲突） | **回滚**（移除 env） |
+
+**意外收获**：多轮对话（superset）模式在 0.32 上命中 59,992/60,000 tokens、prefill 21s→1.2s——多轮长对话场景的续轮响应几乎免费，这是 0.32 相对 0.29 之外的实际体验提升。
+
+最终生产配置变化（相对切换时）：`-QWEN_KV_CPU_GB=8`（offload 移除）、`+QWEN_HASH_ALGO=xxhash`、`+QWEN_MAMBA_SHARED_PREFIX=0`（serve.sh 新增开关）；GPU KV 容量不变（408,423 tokens / 262K 并发 1.55x）。
+
 ## License
 
 笔记与脚本 MIT。vLLM（Apache-2.0）、模型权重与作者 fork 的许可证各自适用。
