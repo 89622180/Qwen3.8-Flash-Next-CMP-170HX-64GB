@@ -505,13 +505,36 @@ decode ~100–108 tok/s（单流）；EngineCore RssAnon 13.3 GiB；80K 单请�
 | 4 | `--prefix-caching-hash-algo xxhash`（uv 装 xxhash 4.0.2） | prefill 持平（27.9/70.0s），decode 在 seed 方差带内；无实测收益但调度器哈希 CPU 开销理论更低 | **保留**（`QWEN_HASH_ALGO=xxhash`） |
 | 5 | flashinfer-jit-cache 0.7.0.post1+cu130（`vllm download-kernels`） | **重试后装上并完成 A/B**：CT120 直连 GitHub 仍阻断（加 192.168.9.2 网关后 code=000）；PVE 直连大文件停滞（~31KB/s、5.6MB 后超时），socks5 代理在 PVE 上不可达（rc=7），最终用 `gh-proxy.com` 镜像下载 116MB sm80 provider wheel。shim + provider 以 `uv pip install --no-deps` 装入 venv，版本校验通过（flashinfer/shim/provider 均 0.7.0.post1），manifest 覆盖 206 个 sm80 模块（sampling/topk/rope/norm/gemm 等）。A/B（同 seed 991-993）：启动 138s vs 141s；prefill 2970/2960/2977 vs 2918/2962/2985 tok/s；decode 204.4/203.7 vs 203.7/204.4 tok/s（seed 992/993 输出完全一致）——**零性能差异**（seed 991 两次输出内容不同，MTP 接受率不可比） | **不保留**（已卸载；wheel 留在 `/root/wheels/` 可随时重装），避免 flashinfer 升级时 jit-cache 版本不匹配导致启动报错的耦合风险 |
 | 6 | `QWEN_ASYNC_SCHED=1` 异步调度 | prefill 慢 2-3%（80K 28.6s / 200K 72.4s），decode 无增益（165.8/182.0/192.4，方差带内）；**且引擎在启动 4 分钟后无请求状态下静默死亡一次**（无 Python 堆栈，疑似原生层崩溃，与 PLE AIO 32 线程冲突） | **回滚**（移除 env） |
-| 7 | KV cache dtype fp8 量化（`--kv-cache-dtype fp8` / `fp8_e5m2`，目标容量翻倍） | 两者在本卡均不可行：`fp8`(e4m3) 被 Triton 拒绝——`type fp8e4nv not supported in this architecture. The supported fp8 dtypes are ('fp8e4b15', 'fp8e5')`（170HX sm80 无原生 e4m3）；`fp8_e5m2` 被模型代码拒绝——`Qwen4Exp QSA requires a BF16 or FP8-e4m3 main KV cache`（NotImplementedError） | **回滚**，KV 保持 BF16（GPU KV 406,974–408,423 tokens） |
+| 7 | KV cache dtype fp8 量化（`--kv-cache-dtype fp8` / `fp8_e5m2`，目标容量翻倍） | `fp8`(e4m3) 在本卡**不可行**（Triton：`type fp8e4nv not supported in this architecture`，170HX sm80 无原生 e4m3）。`fp8_e5m2` 原生被模型代码拒绝，**打补丁后完整跑通**（见 10.4）：KV 720,896 tokens（BF16 406,974，**1.77×**）、262K 并发 1.5x→**2.75x**；质量 3 条 greedy 语义一致；prefill 2948/2917 vs 2918-2985 tok/s、decode 203.6/203.6 vs 203.7-204.4（seed 992/993 输出一致），**性能零损失**；262K 长上下文输出连贯 | **保留**（`QWEN_KV_DTYPE=fp8_e5m2` + QSA e5m2 补丁，`patches/fp8_e5m2_kv_qsa.patch`） |
 
 **flashinfer-jit-cache 操作要点**：① PVE 下载 GitHub 大文件走 `gh-proxy.com`（实测 ~800KB/s）或 `ghfast.top` 镜像；直连会停在几 MB，PVE 自身无法访问 192.168.9.2 的 socks 代理（该代理只对 CT120 网段可用）。② vLLM 0.32 的 `has_flashinfer_cubin()` 检测的是旧版 `flashinfer_cubin` 包，**不识别** `flashinfer_jit_cache`——装 jit-cache 不会改变 vLLM 的门控；flashinfer 运行时通过 entry point（`flashinfer.jit_cache.providers`）自动发现 AOT cubins，本机因 nvcc+ninja 齐全，JIT 路径原本就可用，故无收益。③ shim 与 provider 必须同版本（`_check_jit_cache_version`），且 provider 依赖 shim 全部 6 个架构的声明，缺失时需 `--no-deps` 安装。
 
 **意外收获**：多轮对话（superset）模式在 0.32 上命中 59,992/60,000 tokens、prefill 21s→1.2s——多轮长对话场景的续轮响应几乎免费，这是 0.32 相对 0.29 之外的实际体验提升。
 
-最终生产配置变化（相对切换时）：`-QWEN_KV_CPU_GB=8`（offload 移除）、`+QWEN_HASH_ALGO=xxhash`、`+QWEN_MAMBA_SHARED_PREFIX=0`（serve.sh 新增开关）；GPU KV 容量不变（408,423 tokens / 262K 并发 1.55x）。
+最终生产配置变化（相对切换时）：`-QWEN_KV_CPU_GB=8`（offload 移除）、`+QWEN_HASH_ALGO=xxhash`、`+QWEN_MAMBA_SHARED_PREFIX=0`、`+QWEN_KV_DTYPE=fp8_e5m2`（serve.sh 新增开关）；GPU KV 容量 408,423 → **720,896 tokens**（262K 并发 1.55x → 2.75x）。
+
+### 10.4 FP8(e5m2) KV cache 在 sm80 上的落地（2026-10-23）
+
+sm80 没有原生 e4m3（Triton 只支持 `fp8e4b15`/`fp8e5`），所以只能走 **e5m2**；而 vLLM 0.32 的 Qwen4Exp QSA 路径有多处硬编码只接受 BF16/e4m3，需要 5 个文件的小补丁（`patches/fp8_e5m2_kv_qsa.patch`）：
+
+| 文件 | 改动 |
+|------|------|
+| `vllm/models/qwen4_exp/nvidia/qsa.py` | `supported_kv_cache_dtypes`/两处构造守卫放行 `fp8_e5m2`；`super().__init__` 用 `"auto"` 绕过 FlashAttentionImpl 的 "fp8_e5m2 kv-cache on this device" 拒绝（QSA 从不把这块 cache 交给 FA）；forward 里把 uint8 cache `view(torch.float8_e5m2)` |
+| `vllm/models/qwen4_exp/nvidia/ops/qsa.py` | 注意力 kernel 的 fp8 判定纳入 e5m2；warmup 按 `kv_cache_dtype` 选 e5m2 视图（否则预热编译的是 e4m3 变体） |
+| `vllm/models/qwen4_exp/nvidia/ops/qsa_prepare.py` | fused prepare 的 `_to_dst_dtype` 对 `tl.float8e5` 也做 `x/scale`（原来只处理 `tl.float8e4nv`） |
+| `vllm/models/qwen4_exp/nvidia/indexer_qsa.py` | indexer 读主 KV cache 时同样按 e5m2 重解释 |
+| `vllm/model_executor/warmup/qwen4_exp_qsa_warmup.py` | 把 `kv_cache_dtype` 透传给 QSA warmup |
+
+cache 的物理分配本来就是 uint8（`fp8*` → `torch.uint8`），写入端 scale 是逐 tensor 的 host float，与 dtype 无关；e5m2 的动态范围远大于 e4m3，用 e4m3 校准出的 scale 不会溢出，代价只是 2-bit 尾数（相对误差 ~12%）。注意力 kernel 把 K upcast 回 BF16、V upcast 回 FP16 后计算，dequant scale 折进 `softmax_scale`/`output_scale`。
+
+实测（同机，`/root/kv_quality*.json`、`/root/bench_e5m2.log`）：
+
+- 启动：`Using fp8_e5m2 data type to store kv cache` → `GPU KV cache size: 720,896 tokens`，262K 并发 **2.75x**（此前 1.5x 连两条 262K 都放不下）；QSA prepare/decode/sparse 全部 kernel 预热无报错，启动 ~166s（BF16 ~141s，多出的是 e5m2 编译变体）。
+- 质量：greedy seed 42 三条（Fibonacci/前缀缓存/平均速度）与 BF16 语义一致，p3 同为 `60 km/h`；措辞有微小差异属正常。
+- 性能（200K prefill + 256 decode）：seed 992/993 输出与 BF16 完全一致时，prefill 2948/2917 tok/s（BF16 2918-2985）、decode 203.55/203.63（BF16 203.7-204.4）——**零损失**。seed 991 的 3756 tok/s / 140.8 tok/s 是缓存命中 + MTP 接受率不同的假象，不可比。
+- 262K 单请求：输出连贯；TTFT 20.7s 属前缀命中（前次 200K 请求留下的 cache），非冷启动数据。
+
+**回滚**：删除 unit 中 `Environment=QWEN_KV_DTYPE=fp8_e5m2` → `systemctl daemon-reload` → `cd /root/vllm-latest && git checkout -- <上面 5 个文件>` → 重启（BF16 cache 会重新分配，KV 回到 ~408K tokens）。补丁可用 `git apply patches/fp8_e5m2_kv_qsa.patch` 重新打上。
 
 ## License
 
