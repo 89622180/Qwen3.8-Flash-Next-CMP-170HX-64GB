@@ -4,6 +4,7 @@
 核心思路：**95.43 GiB 的 PLE/n-gram 表放 SSD（O_DIRECT 原生 Linux AIO，不进 RAM 也不进 ARC），主模型 47.05 GiB 常驻显存**。
 本文记录 2026-10-10 一天之内的调优全过程：冷 prefill 从 ~3,550 → ~3,500+（32k）、**200k 长上下文从 2,264 → ~3,525 tok/s（+56 %）、TTFT 从 88.5 s → ~56.5 s**，以及每一个被否决的方案（诚实版）。
 2026-10-14 第二轮（chunk 上探 8K/16K、显存天花板 0.983、同日四配置 A/B）见第 8 节——**最终配置改为 chunk 2048 / util 0.99**（同日全指标最优，KV 池 393,940）。
+2026-10-22/23 第三轮（PLE 行缓存大小矩阵、预取 limit 公式 90% 放宽、ARC 降 2G、recordsize 论证、util 0.995）见第 9 节——**最终配置 cache 2048 MiB / prefetch 262144 / util 0.995（KV 池 405,526）**。
 
 ## 对比一览：作者原版 vs 本仓库最终
 
@@ -27,13 +28,15 @@
 | MTP acceptance | 未公布（MTP=1） | 2.37–2.45 @ 69–73 %（第二 draft 位置命中 62 %） | — |
 
 > **2026-10-14 复测更新**：同脚本同配置（3072+0.99）复测得 8k 2,782 / 32k 2,924 / 131k 3,018 / 200k 2,968 / C4 2,955——比 10-10 整体低 ~15 %，是**跨天环境漂移**（见 8.7），不是配置回退。第二轮同日四配置 A/B（8.4）后**最终配置改为 chunk 2048 + util 0.99**（同日全指标最优、KV 池 393,940）。上表 10-10 数字保留作历史记录；跨天绝对数字不可比，配置结论只认同日 A/B。
+>
+> **2026-10-23 第三轮更新（第 9 节）**：最终配置再改为 **util 0.995（KV 池 405,526，0.997 会被启动门禁拒绝）+ PLE 行缓存 2048 MiB + 预取 262144 + limit 90 % 公式 + ARC 2 GiB**。本轮 200k 实测 ~70 s / ~2,900 tok/s（80k ~27 s、262k ~90 s），绝对值继续落在 8.7 的跨天漂移带内；配置结论同样只来自本轮同日 A/B。
 
 **两边配置差（这才是上表差距的来源）**：
 
 | 项 | 作者原版 | 本仓库最终 |
 |---|---|---|
 | PLE 读 | 补丁内单线程 `ple_ssd_io.c` | 多线程 AIO（`patches/ple_ssd_io_mt.c`，`PLE_AIO_THREADS=32`） |
-| 预读窗口 | `16K prompt read-ahead` | **全窗口**（2 行补丁，覆盖整条剩余 prompt） |
+| 预读窗口 | `16K prompt read-ahead` | **全窗口**（2 行补丁；第三轮起受 90 % 行缓存上限约束，见 9.3） |
 | chunk / MTP | 2048 / 1 | **2048 / 2**（10-14 同日 A/B 后回到 2048，见 8.4） |
 | 显存 util | 0.96 | **0.99** |
 | CPU 绑核 | 无 | `CPUAffinity=0 3 4 6 8 10`（一个 P-core 一线程） |
@@ -91,6 +94,8 @@
 ```
 
 预取速率 66k rows/s > 200k 消耗速率 36k rows/s（1.8× 余量），512 MiB 行缓存当滑动窗口用。改完后 **200k 的盘 util 42 % → 72.6 %，prefill 与 32k 同速——长度轴拉平**。`QWEN_SSD_PREFETCH` 这个 env 从此失效（`limit` 不再被使用）。
+
+> **10-23 更新（见 9.3）**：第三轮给 `submit()` 加回了 `tokens[: history + self.limit]` 截断——`limit` 重新生效，但公式从「行缓存 50 %」放宽到 **90 %**，`QWEN_SSD_PREFETCH=262144` 重新有意义（全窗口补丁 + `patches/ple_ssd-limit90.patch` = 最终形态）。
 
 ### 2.2 AIO 线程 16→32
 
@@ -220,19 +225,22 @@ MTP acceptance 2.37–2.45 @ 69–73 %。decode 阶段盘 util 4 %——完全�
 ```
 ├── README.md                        # 本文
 ├── patches/
-│   ├── ple_ssd-fullwindow.patch     # 全窗口预取补丁（2 行，本日核心收益 +46 % @200k）
-│   ├── ple_ssd.py                   # 打好补丁的完整文件（直接覆盖用）
+│   ├── ple_ssd-fullwindow.patch     # 全窗口预取补丁（2 行，第一轮核心收益 +46 % @200k）
+│   ├── ple_ssd-limit90.patch        # 第三轮：submit() 加回 limit 截断 + 公式 50 %→90 %
+│   ├── ple_ssd.py                   # 打好全部补丁的完整文件（直接覆盖用，最终形态）
 │   └── ple_ssd_io_mt.c              # 多线程 AIO 读取器源码（PLE_AIO_THREADS 控制）
 ├── configs/
-│   ├── perf.conf                    # systemd drop-in（最终配置：chunk 2048 / util 0.99）
-│   └── serve.sh                     # 引擎启动脚本（全 env 参数化）
+│   ├── perf.conf                    # systemd drop-in（最终配置：cache 2048 MiB / prefetch 262144 / util 0.995）
+│   └── serve.sh                     # 引擎启动脚本（全 env 参数化，含 KV offloading 开关）
 └── scripts/
     ├── bench.sh                     # 唯一基准脚本 v1（身份门禁 + 3×32k + 131k/200k + 200k decode）
     ├── c4prefill.sh                 # C4 并发 prefill（4×32k）
     ├── decol.sh                     # decode/并发梯度（C1/4/8/16）
     ├── mttest.py                    # .so 字节级等价性 + 速率 harness
     ├── bench_cachehit.py            # PLE 行缓存命中口径基准（pangram 重复文本，部署名 /root/bench_prefill.py）
-    └── fill_context.py              # 打满 262,144 上下文测试（99.8 % 填满）
+    ├── fill_context.py              # 打满 262,144 上下文测试（99.8 % 填满）
+    ├── ple_bench_200k.py            # 第三轮口径：80K 参照 + 200K prompt（按轮数播种，防前缀缓存跨轮命中）
+    └── ple_bench_max.py             # 第三轮口径：单条 262,000 prompt（模型上下文上限）
 ```
 
 **复现步骤**：
@@ -246,10 +254,11 @@ curl -L -o /tmp/qwen38-ple-ssd.patch \
 git apply /tmp/qwen38-ple-ssd.patch
 # 按 docs/GUIDE.md 建 venv、编译 vllm 与原版 ple_ssd_io.so
 
-# 1. 打本仓库的全窗口补丁（或直接 cp patches/ple_ssd.py 覆盖）
+# 1. 打本仓库的补丁（或直接 cp patches/ple_ssd.py 覆盖 = 全窗口 + limit 90 % 最终形态）
 cd /root/vllm/src/vllm/models/qwen4_exp/nvidia/
 cp ple_ssd.py ple_ssd.py.orig
 patch -p1 < ple_ssd-fullwindow.patch   # 从仓库根目录: patch -p1 -d /root/vllm < patches/ple_ssd-fullwindow.patch
+patch -p1 < ple_ssd-limit90.patch      # 第三轮补丁（在 fullwindow 之上）
 
 # 2. 编译多线程 AIO 读取器
 cc -O3 -shared -fPIC -Wall -Wextra -Werror -pthread \
@@ -266,6 +275,9 @@ bash scripts/decol.sh        # decode 梯度（高 util 下 C16 会 OOM，见踩
 # 第二轮补充口径（8.5 / 8.8）：
 python scripts/bench_cachehit.py 55000 5 256   # PLE 行缓存命中口径（pangram）
 python -u scripts/fill_context.py              # 打满 262,144 上下文
+# 第三轮补充口径（第 9 节，每轮换 seed 防前缀缓存命中）：
+python scripts/ple_bench_200k.py <label> /tmp/r1.json 1   # 80K 参照 + 200K prompt
+python scripts/ple_bench_max.py  <label> /tmp/r1.json 1   # 单条 262,000 prompt
 ```
 
 `serve.sh` 的可调 env：`QWEN_MTP`（speculative tokens）、`QWEN_BATCH_TOKENS`（chunk）、`QWEN_CAPTURE_SIZES`（**必须包含 chunk 值**，否则 prefill 掉出 full-graph 覆盖）、`QWEN_SEQS`、`QWEN_SSD_*`。`PLE_AIO_THREADS` 是 `.so` 的 env（`rows_open` 时读取，改了要重启）。
@@ -274,7 +286,7 @@ python -u scripts/fill_context.py              # 打满 262,144 上下文
 
 - vLLM `0.29.1rc1.dev402+ga5a30471f.ple1`（作者 fork，`/root/vllm/src/vllm` 源码树安装）
 - torch 2.13.0+cu130 · CUDA 13 · nvidia-open 驱动（cmpunlocker 解锁 300 W）
-- ZFS（`recordsize=4K` PLE 数据集、`zfs_arc_max=8589934592` 经 `/etc/tmpfiles.d/zfs-arc.conf` 持久化）
+- ZFS（`recordsize=4K` PLE 数据集、`zfs_arc_max=2147483648`（2 GiB，第三轮从 8 GiB 下调——9.4 实测无差异）经 `/etc/modprobe.d/zfs.conf` 持久化）
 - 模型 `klee100/Qwen3.8-Flash-Next-AutoRound-3bpw-MTP`（13 个 safetensors，PLE 表在 `ple-dedicated-*` 分片）
 - PVE 9.2 / LXC CT120 / i5-14600K / 62 GiB DDR4 / CMP 170HX 64 GiB
 
@@ -339,6 +351,116 @@ python -u scripts/fill_context.py              # 打满 262,144 上下文
 
 - `scripts/bench_cachehit.py`：PLE 行缓存命中口径（pangram 重复文本 + 唯一 nonce 前缀，零前缀缓存命中）。用法 `python bench_cachehit.py 55000 5 256`。
 - `scripts/fill_context.py`：把上下文打满到 262,144（预算式构建 + HTTP 400 自动重试），报告填满率与 prefill 速率。
+
+## 9. 第三轮调优实录（2026-10-22/23）：行缓存矩阵、limit 公式与 0.995
+
+本轮口径与前两轮不同，先说清楚再上数字：
+
+- **长度轴换成 80K / 200K / 262K**（`scripts/ple_bench_200k.py` / `scripts/ple_bench_max.py`）：80K 是「预取能覆盖」的参照长度，200K/262K 才能把行缓存的工作集（200K × 16 行 × 320 B ≈ 1.0 GiB）推出小缓存。
+- **每轮换 seed**（`random.Random(770000 + length + round×1e6)`）：随机 token 跨轮重复会命中 GPU 前缀缓存，虚高到 160k tok/s；换轮换 seed 后每条都是真冷启动。
+- **每个配置臂重启进程**（`systemctl restart`），避免行缓存/ARC 残留。
+- 跨天漂移（8.7）依然成立：本轮 200k ~70 s / ~2,900 tok/s，绝对值比 10-10 低 ~15 %，与 10-14 复测同带；**本轮所有结论只来自本轮同日 A/B**。
+
+### 9.1 CPU KV offload 是死容量：20 GiB → 8 GiB
+
+`QWEN_KV_CPU_GB=20` 跑了一整天，`external prefix cache hit` 恒为 0 %——PLE SSD 路径下 CPU KV 层从不被命中，20 GiB 是纯占内存。砍到 8 GiB：prefill/decode 全指标无变化，EngineCore `RssAnon` 13.3 GiB。**结论：这个参数只决定内存占用，不决定性能。**
+
+### 9.2 行缓存大小矩阵：80K 无差异，200K+ 决定性
+
+| `QWEN_SSD_CACHE_MB` | 80K TTFT | 200K TTFT | 200K tok/s |
+|---:|---:|---:|---:|
+| 512 | 36.6 / 37.1 s | 102.43 s | 2,003 |
+| 1024 | ~28 s | 95.15 s | 2,159 |
+| 2048（原公式） | 28.5–29.6 s | 81.6 / 82.9 s | 2,470 |
+| 4096 | 28.1–28.8 s | **70.30 / 71.09 s** | 2,881–2,913 |
+| **2048（90 % 公式）** | **27.6–27.9 s** | **70.02 / 71.30 s** | **2,875–2,925** |
+
+- 80K 下 2G 与 4G 无差异（三轮 28.46/28.72/29.55 vs 28.14–28.83，全在轮间波动内）：PLE 行访问是 ngram hash 随机行，缓存大小只影响重复命中的少量行，**预取覆盖才是关键**。
+- 200K 单请求物理读 ~19.3 GiB（4K 块 × 随机 320 B 行 ≈ 12.8× 放大），与 cache/ARC 大小基本无关——差异全部来自预取窗口（见 9.3）。
+- 262K（90 % 公式 + 2G）：89.95 s / 2,913 tok/s。
+
+### 9.3 根因不是缓存，是 limit 公式：50 % → 90 %
+
+`PLEPromptPrefetcher.__init__`（ple_ssd.py:319）：
+
+```python
+self.limit = min(limit, self.table.cache_limit // (2 * ngram.ngram_heads))
+```
+
+`cache_limit = cache_mb × 1 MiB // (row_bytes + 128)`（行 320 B + 128 B 记账 = 448 B/行），`ngram_heads = 32`：
+
+| cache | cache_limit（行） | 50 % 公式 → 预取窗口（token） | 90 % 公式 |
+|---:|---:|---:|---:|
+| 2 GiB | 4,792,627 | **149,769** | 4,313,364 |
+| 4 GiB | 9,585,254 | 299,539（min 后取满 262,144） | — |
+
+200K prompt 在 2G + 50 % 公式下只有前 ~150K 被预取，**尾部 55K 落回 demanded 读关键路径**——这就是 81.6 s vs 70.3 s 的全部差距。4G 快不是缓存大，是公式允许它预取满。
+
+**修法**（`patches/ple_ssd-limit90.patch`，两处）：
+
+```diff
+-        self.limit = min(limit, self.table.cache_limit // (2 * ngram.ngram_heads))
++        self.limit = min(limit, self.table.cache_limit * 9 // (10 * ngram.ngram_heads))
+...
+         tokens = tokens[start - history :]
++        # Bound read-ahead to what the shared row cache can actually hold.
++        tokens = tokens[: history + self.limit]
+```
+
+第二行把全窗口补丁（2.1）删掉的 `limit` 截断加回来——**预取窗口重新受控**，`QWEN_SSD_PREFETCH=262144` 重新有意义。90 % 余量：262,144 token 窗口需要 4.19M 行，2G 的 90 % = 4.31M 行，刚好覆盖且给 history 留 ~12 %。**2G + 90 % 与 4G 完全持平**（上表末行），1G 放宽后也只剩 135K token，仍退化——**2G 是 262,144 窗口的下限，最终定 2G**。
+
+### 9.4 ZFS ARC 8G / 4G / 2G 无差异
+
+一次性随机读，ARC 命中率本就 ~8.4 %（8 GiB / 95 GiB），粒度只影响 miss 代价。同日 A/B（cache 4G @200K）：ARC 4G = 70.30/71.09 s、2G = 72.21/70.82 s——无差异。`zfs_arc_max` 已从 8 GiB 降到 **2 GiB**（`/etc/modprobe.d/zfs.conf` + runtime `/sys/module/zfs/parameters/zfs_arc_max`）。注意这是 rpool 全局参数，其他 dataset/容器的缓存一起变小。
+
+`zfs_prefetch_disable=1`：微基准下随机读 IOPS +34 %，但实机 80K（27.42 vs 28.14/28.40 s）差异在 ±1 s 噪声内——已回退，不值得全局改。
+
+### 9.5 recordsize 4K 论证：大块是纯负优化
+
+「/models 是 4K 块，会不会让表变大？换 512K/1M/4M 块是不是更快？」——微基准回答（`primarycache=none` 隔离，1 GiB 真实 PLE 数据，10,000 次随机 320 B `pread`）：
+
+| recordsize | IOPS | 每逻辑读字节 | 读放大 |
+|---|---:|---:|---:|
+| **4K** | **6,895** | 16,785 | ~1× |
+| 512K | 2,713 | 556,452 | ~60× |
+| 1M | 1,976 | 1,071,254 | ~113× |
+| 4M | 790 | 3,436,592 | ~362× |
+
+- PLE 访问是 ngram hash 随机行，**无局部性 → 大块没有顺读红利，纯读放大**（512K 一次 miss 拉整块 1,638 行）。
+- 磁盘占用四者相等（1.1G/1GiB；4K 多 ~20 MiB metadata，~2 %）——「4K 让表变大」不成立。
+- ARC 命中率不受块大小影响。**结论：保持 4K，别为 PLE 建大块 dataset。**
+
+### 9.6 试过并回滚的两个改动
+
+- **预取批 256 → 2048**：200K 101 s（+43 % 慢）；→128 与 256 持平。机制：每个预取批持全局 condition 锁同步完成，批越大 demanded 读等得越久。**保留 256**（= AIO 深度）。
+- **双 AIO lane**（prefetch/demand 各自 native context 并发，去掉全局让位锁）：80K 31.5 vs 28.1 s、200K 74–78 vs 70.3 s，**慢 5–10 %**。demanded 读的优先让位语义比 I/O 并发更重要——回滚。
+
+### 9.7 显存 0.995 天花板
+
+- 0.99 → **0.995**：KV 池 393,940 → **405,526 token（11.47 GiB，1.55× 262k）**，200K/262K prefill 无回归。
+- 0.997 启动失败：vLLM 门禁要求 free(63.09 GiB) ≥ 预算(63.2 GiB)，torch 只见 63.39 GiB、启动前驱动已占 0.30 GiB——**上限 0.9953**。
+- 显存账本：固定开销 52.54 GiB（权重 48.31 + peak activation 3.29 + CUDAGraph 0.94）；每 token KV 记账 **30.4 KB**（纯 attention 24.6 KB，hybrid 页对齐把 mamba 状态摊进 attention 块抬上来 23 %）；单条 262K KV = 7.42 GiB，两条 262K = 14.84 GiB 放不下（1.55×）。
+
+### 9.8 I/O 画像与瓶颈定位
+
+- NVMe 随机 320 B pread 上限：1 线程 6.9k / 32 线程 100k / 128 线程 157k IOPS；**生产只跑 ~40k——瓶颈在流水线不在盘**。
+- GPU util 采样：42 % 样本 ≥90 %，38 % 在 1–69 %——约一半时间 GPU 在等 I/O，这是 PLE-SSD 架构的结构性上限（全表进内存才能消掉，见 8.6）。
+
+### 9.9 最终配置与数字（2026-10-23 定稿）
+
+```
+QWEN_SSD_CACHE_MB=2048   QWEN_SSD_PREFETCH=262144   limit 90 % 公式补丁
+QWEN_KV_CPU_GB=8         QWEN_GPU_MEMORY=0.995      QWEN_MTP=2
+QWEN_BATCH_TOKENS=2048   PLE_AIO_THREADS=32         ARC 2 GiB   recordsize 4K
+```
+
+| 长度 | TTFT | tok/s |
+|---:|---:|---:|
+| 80K | 27.6–27.9 s | ~2,900–2,960 |
+| 200K | 70.02–71.30 s | ~2,875–2,925 |
+| 262K | 89.95 s | 2,913 |
+
+decode ~100–108 tok/s（单流）；EngineCore RssAnon 13.3 GiB；80K 单请求物理读 8.3–9.4 GiB、200K ~19.3 GiB。
 
 ## License
 

@@ -22,6 +22,23 @@ mode=(--compilation-config "{\"cudagraph_mode\":\"${QWEN_GRAPH_MODE:-FULL_AND_PI
 if [[ ${QWEN_EAGER:-0} == 1 ]]; then
     mode=(--enforce-eager)
 fi
+kvoff=()
+if [[ -n ${QWEN_KV_CPU_GB:-} ]]; then
+    kvoff=(--kv-offloading-size "${QWEN_KV_CPU_GB}" --kv-offloading-backend native --prefix-match-unit "${QWEN_PMU:-8}")
+    export VLLM_USE_SIMPLE_KV_OFFLOAD=1
+fi
+async=()
+if [[ ${QWEN_ASYNC_SCHED:-0} == 1 ]]; then
+    async=(--async-scheduling)
+fi
+cumem=()
+if [[ ${QWEN_CUMEM:-0} == 1 ]]; then
+    cumem=(--enable-cumem-allocator)
+fi
+kvdtype=()
+if [[ -n ${QWEN_KV_DTYPE:-} ]]; then
+    kvdtype=(--kv-cache-dtype "${QWEN_KV_DTYPE}")
+fi
 command=("$VLLM_VENV/bin/vllm" serve "$QWEN_MODEL_DIR" \
     --served-model-name Qwen3.8-Flash-Next \
     --host "${QWEN_HOST:-0.0.0.0}" --port "${QWEN_PORT:-8000}" \
@@ -37,7 +54,7 @@ command=("$VLLM_VENV/bin/vllm" serve "$QWEN_MODEL_DIR" \
     --reasoning-parser qwen3 \
     --enable-auto-tool-choice --tool-call-parser qwen3_xml \
     --additional-config "{\"ple_ssd_offload\":true,\"ple_ssd_workers\":${QWEN_SSD_WORKERS:-16},\"ple_ssd_cache_mb\":${QWEN_SSD_CACHE_MB:-512},\"ple_ssd_native_library\":\"${VLLM_WORKDIR}/optimization/ple_ssd_io.so\",\"ple_ssd_io_depth\":${QWEN_SSD_DEPTH:-256},\"ple_ssd_prefetch_tokens\":${QWEN_SSD_PREFETCH:-16384}}" \
-    "${mode[@]}" "${spec[@]}")
+    "${mode[@]}" "${spec[@]}" "${kvoff[@]}" "${async[@]}" "${cumem[@]}" "${kvdtype[@]}")
 if [[ ${QWEN_PRINT_COMMAND:-0} == 1 ]]; then
     printf "%q " "${command[@]}"
     printf "\n"

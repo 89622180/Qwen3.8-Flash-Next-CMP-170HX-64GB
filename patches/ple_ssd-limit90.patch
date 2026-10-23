@@ -1,0 +1,20 @@
+--- a/vllm/src/vllm/models/qwen4_exp/nvidia/ple_ssd.py	2026-10-22 20:00:00.000000000 +0000
++++ b/vllm/src/vllm/models/qwen4_exp/nvidia/ple_ssd.py	2026-10-23 02:00:00.000000000 +0000
+@@ -316,7 +316,7 @@
+         self.ngram._modules = {}
+         self.ngram._parameters = {}
+         self.ngram._buffers = {k: v.detach().cpu() for k, v in ngram._buffers.items()}
+-        self.limit = min(limit, self.table.cache_limit // (2 * ngram.ngram_heads))
++        self.limit = min(limit, self.table.cache_limit * 9 // (10 * ngram.ngram_heads))
+         self._pool = ThreadPoolExecutor(1, thread_name_prefix="ple-prompt")
+         self._future: Future | None = None
+         self._stop = threading.Event()
+@@ -331,6 +331,8 @@
+             self._future.result()
+         history = min(start, self.ngram.ngram_size - 1)
+         tokens = tokens[start - history :]
++        # Bound read-ahead to what the shared row cache can actually hold.
++        tokens = tokens[: history + self.limit]
+         self._request_id = request_id
+         self._stop.clear()
+         self._future = self._pool.submit(self._prefetch, tokens, history)
