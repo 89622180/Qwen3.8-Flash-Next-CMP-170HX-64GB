@@ -466,6 +466,31 @@ QWEN_BATCH_TOKENS=2048   PLE_AIO_THREADS=32         ARC 2 GiB   recordsize 4K
 
 decode ~100–108 tok/s（单流）；EngineCore RssAnon 13.3 GiB；80K 单请求物理读 8.3–9.4 GiB、200K ~19.3 GiB。
 
+## 10. vLLM 0.32.0 移植与 A/B 对比（2026-10-23）
+
+### 10.1 移植内容（容器内分支 `ple-latest`，CT120 `/root/vllm-latest`）
+
+- 基线：上游 **vLLM 0.32.0**（tag `5df63a72`），PyPI wheel + editable 源码覆盖（`VLLM_PRECOMPILED_WHEEL_LOCATION` 指向从 uv 缓存重打包的 wheel）。
+- `git apply -3` 作者 `qwen38-ple-ssd.patch`：9 文件干净应用，2 文件冲突手工解决：
+  - `nvidia/ngram_embedding.py`：0.32.0 已把 PLE embedding 类移到 `qwen4_exp/common/ngram_embedding.py` 且 prefetch API 变为单参 `start_prefetch(ngram_ids)` + 新增抽象 `finalize_prefetch(total_tokens)`——冲突取 ours（丢 fork 内联旧类），保留 `use_reduce_scatter` 与 `ple_ssd_offload` 钩子（both）。
+  - `v1/worker/gpu/cudagraph_utils.py`：合并 0.32.0 的 `capture_pool()`（cuMem 感知）与补丁的 `BreakableCUDAGraphCapture` 分支为单一 with 元组。
+- `ple_ssd.py`：生产版（limit 90% 公式 + 全窗口预取）适配新 API：`start_prefetch` 单参、新增 `finalize_prefetch(total_tokens)` 包装 `_finalize_prefetch`。
+- `ple_ssd_io.c`：多线程 AIO（`PLE_AIO_THREADS=32`）原样带入。
+- **新踩坑（0.32.0 独有）**：`common/ngram_embedding.py` 的 `from_quant_config` 对 INCConfig 会调 `config_parser.resolve()`，而 AutoRound 的 `extra_config` regex 键是 HF 张量名（`model.language_model...`），`apply_vllm_mapper` 不改写 regex 键 → 运行时前缀（`language_model.model.layers.N.ple...`）落回 2-bit 默认值 → `NotImplementedError`。修复：PLE embedding 对 INCConfig 一律返回 Unquantized（与 ple1 fork 行为一致，PLE 表本来就是 BF16）。commit `dc53addc`。
+- systemd 并列单元 `qwen38-032-test.service`（同 perf 参数、`VLLM_WORKDIR=/root/vllm-latest`），与生产 `qwen38-3bpw-ple-ssd` 互斥切换；CT120 的 mp0 `/models` 挂载在快照恢复时曾丢失，已重新 `pct set 120 -mp0 /models,mp=/models,backup=0`。
+
+### 10.2 A/B 实测（同机同参数，seed 轮换防前缀缓存）
+
+| 指标 | 0.29 生产（ple1 fork） | 0.32.0 移植（ple-latest） | 差异 |
+|---|---:|---:|---|
+| 80K prefill | 28.2 s / 2,900 tok/s | 27.5 s / 2,976 tok/s | ≈持平 |
+| 200K prefill | 72.7 s / 2,818 tok/s | 72.9 s / 2,808 tok/s | ≈持平 |
+| 262K prefill | 91.8 s / 2,854 tok/s | 95.0 s / 2,757 tok/s | 0.32 慢 ~3.5% |
+| 200K prefill（d200k 口径） | 2,897 tok/s | 2,898 tok/s | 持平 |
+| 200K decode 128 tok（单流） | **173.6 tok/s** | **184.2 tok/s** | **0.32 快 ~6%** |
+
+结论：prefill 两版持平（262K 略慢但在单次样本噪声内），**decode 0.32.0 快约 6%**（推测来自上游调度/采样路径的常规优化）。0.32.0 移植版功能完整可用，但暂不替换生产——0.29 生产稳定运行中，切换收益仅 decode 6%，待长期观察后再定。
+
 ## License
 
 笔记与脚本 MIT。vLLM（Apache-2.0）、模型权重与作者 fork 的许可证各自适用。
