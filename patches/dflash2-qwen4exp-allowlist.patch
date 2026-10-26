@@ -1,0 +1,36 @@
+diff --git a/vllm/model_executor/models/config.py b/vllm/model_executor/models/config.py
+index d64e51bf..299d3e35 100644
+--- a/vllm/model_executor/models/config.py
++++ b/vllm/model_executor/models/config.py
+@@ -948,14 +948,25 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
+         if multimodal_config is not None and multimodal_config.language_model_only:
+             _strip_qwen4_exp_mrope(vllm_config.model_config)
+         spec_config = vllm_config.speculative_config
+-        if spec_config is not None and spec_config.method not in {
+-            "mtp",
+-            "ngram",
+-            "ngram_gpu",
+-        }:
++        # A DFlash2 draft reads completed target layers through the aux
++        # hidden-state path Qwen4ExpModel exposes for it.
++        is_dflash2_draft = (
++            spec_config is not None
++            and spec_config.method == "dflash"
++            and bool(
++                {"DFlash2DraftModel"}.intersection(
++                    getattr(spec_config.draft_model_config, "architectures", ()) or ()
++                )
++            )
++        )
++        if (
++            spec_config is not None
++            and spec_config.method not in {"mtp", "ngram", "ngram_gpu"}
++            and not is_dflash2_draft
++        ):
+             raise NotImplementedError(
+                 "Qwen4Exp speculative decoding supports only its native MTP "
+-                "checkpoint and linear n-gram proposers"
++                "checkpoint, linear n-gram proposers, and DFlash2 drafts"
+             )
+ 
+ 

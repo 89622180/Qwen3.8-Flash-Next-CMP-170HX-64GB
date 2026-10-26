@@ -538,6 +538,98 @@ cache 的物理分配本来就是 uint8（`fp8*` → `torch.uint8`），写入�
 
 **回滚**：删除 unit 中 `Environment=QWEN_KV_DTYPE=fp8_e5m2` → `systemctl daemon-reload` → `cd /root/vllm-latest && git checkout -- <上面 5 个文件>` → 重启（BF16 cache 会重新分配，KV 回到 ~408K tokens）。补丁可用 `git apply patches/fp8_e5m2_kv_qsa.patch` 重新打上。
 
+## 11. DFlash2 草稿模型移植（2026-10-25/26）
+
+incoai 发布 [`Qwen3.8-Flash-Next-DFlash2`](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2) 后，本节记录它在 vLLM fork 上的移植过程与实测。**结论：可行，short-context decode +23%，但 prefill −9%、KV 池 −44%，且需要两处代码补丁 + draft 专用 attention backend。默认不上线，MTP=5 仍是生产配置。**
+
+### 11.1 模型与目标模型的兼容性
+
+| 项 | draft | target（本地 AutoRound） | 判定 |
+| --- | --- | --- | --- |
+| architectures | `DFlash2DraftModel` | `Qwen4ExpForConditionalGeneration` | 注册表已有 `qwen3_dflash2.DFlash2Qwen3ForCausalLM` |
+| hidden_size | 2560 | 2560 | ✅ |
+| vocab_size | 248320 | 248320 | ✅ |
+| num_target_layers | 48 | 48（qwen4_exp_text） | ✅ |
+| target_layer_ids | [5,15,25,35,45] | — | 落在范围内 |
+| 权重 | `fc.weight [2560,12800]` | — | 5 层 × 2560 = 12800 ✅ |
+
+### 11.2 缺的三块（都要补）
+
+1. **目标模型不产出 aux hidden state**。`Qwen4ExpModel` 是纯 `nn.Module`，没有 `EagleModelMixin`，`set_aux_hidden_state_layers` 会直接 `AssertionError`。draft 的 `use_aux_hidden_state` 默认 True，取不到 12800 维特征就在 `combine_hidden_states` 抛错。
+2. **spec-decode 白名单**。`vllm/model_executor/models/config.py` 的 `Qwen4ExpForConditionalGenerationConfig` 只允许 `mtp`/`ngram`/`ngram_gpu`。
+3. **draft 需要独立的 attention backend**（见 11.3，这是最关键的一条）。
+
+### 11.3 关键：draft 必须单独用 TRITON_ATTN + bf16 KV
+
+不这样做时，DFlash2 能跑但**同时踩三个坑**：
+
+| 现象 | 根因 |
+| --- | --- |
+| decode 只有 32 tok/s | `supports_trtllm_attention()` 在 sm80 返回 False → FlashInfer 封顶 `UNIFORM_SINGLE_TOKEN_DECODE`；DFlash2 每步验证 1+K 个 token，超限后整引擎 `cudagraph_mode=NONE`（全 eager） |
+| KV 池 590,414 → **11,828** tokens | draft 的 SWA 组因 `page_budget` 不足选了 `block_size=64`，与 target 的 3280 求 lcm = **13120**（4× 膨胀） |
+| 上下文 262,144 → 11,776 | 同上，auto-fit 被压到 11.7K |
+
+**解法**：在 `--speculative-config` 里给 draft 单独指定：
+
+```json
+{"method":"dflash","model":"/models/incoai-Qwen3.8-Flash-Next-DFlash2",
+ "num_speculative_tokens":4,"attention_backend":"TRITON_ATTN","kv_cache_dtype":"bfloat16"}
+```
+
+target 保持 FlashInfer + `fp8_e5m2` 不变。Triton 后端 `_cudagraph_support = ALWAYS`、`supports_draft_decode_metadata_update = True`、块尺寸 `MultipleOf(16)`，三坑同愈——`lcm` 回 3216、262K 全上下文、CUDA graph 恢复、init engine 从 225 s 降到 27 s。draft 只有 5 层 × 2048 窗口，bf16 的额外显存可忽略。
+
+### 11.4 补丁清单
+
+| 文件 | 改动 |
+| --- | --- |
+| [`patches/dflash2-target-aux-hidden.patch`](../patches/dflash2-target-aux-hidden.patch) | `Qwen4ExpModel` 加 `EagleModelMixin`；forward 中当 `(layer_idx+1) ∈ [6,16,26,36,46]` 时把 HC 延迟 combine 就地 materialize，对 4 条 hyper-connection 流求均值，append 到 aux；末尾返回 `(hidden, aux)` |
+| [`patches/dflash2-qwen4exp-allowlist.patch`](../patches/dflash2-qwen4exp-allowlist.patch) | 白名单放行 `method=="dflash"` 且 draft 架构为 `DFlash2DraftModel` 的组合 |
+| [`configs/serve.sh`](../configs/serve.sh) | 新增 `QWEN_SPEC=dflash2` 分支，`QWEN_SPEC_ATTN_BACKEND` / `QWEN_SPEC_KV_DTYPE` 可覆盖 |
+
+两处 Python 补丁在未设 `QWEN_SPEC=dflash2` 时完全惰性，对 MTP 路径零影响（实测 KV 池数值与基线完全一致）。
+
+### 11.5 实测（同脚本 4 轮中位，2026-10-26）
+
+decode（1024 输出，短上下文，`head2head.py`）：
+
+| 配置 | tok/s | 接受/步 | KV 池 | lcm |
+| --- | ---: | ---: | ---: | ---: |
+| MTP=5（基线） | 114.1 | 1.68 | 590,414 | 3232 |
+| **DFlash2 K=4** | **140.3** | 1.63 | 328,829 | 3216 |
+| DFlash2 K=5 | 127.3 | 1.67 | 315,461 | 3232 |
+| DFlash2 K=3 | 132.0 | — | — | — |
+| DFlash2 K=7 | 116 | 1.66 | 295,969 | 3280 |
+
+prefill（`coldonly.py`，4×200K 新种子冷启动，外部请求计数前后一致）：
+
+| 配置 | ttft 中位 | prefill tok/s |
+| --- | ---: | ---: |
+| MTP=5 | 65.5 s | **3047** |
+| DFlash2 K=4 | 71.5 s | **2800** |
+
+- **decode 短上下文 +23%**；K=4 是最优点（K=5/7 递减，K=3 略低）。
+- **prefill −9%**：aux 采集要在 5 个指定层强制 materialize HC combine 再求均值，每个 8192-token chunk 多付 5 次 kernel 与约 1.7 GB/chunk 的额外读写。
+- **200K 长上下文下两者 decode 打平**（~291 tok/s，256 输出）——DFlash2 的优势主要在短上下文。
+- 接受率 ~1.65/步，与 MTP 相当，远低于模型卡的 3.26（那是 GB300 单卡 + 官方 FP8 checkpoint 的数字）。
+- **代价：GPU KV 池 590,414 → 328,829 tokens（并发 2.25x → 1.25x）**。
+
+### 11.6 取舍与回滚
+
+短上下文、重 decode 的负载可选 DFlash2 K=4；需要高并发长上下文时用 MTP=5。
+
+回滚到 MTP：
+
+```bash
+rm -f /etc/systemd/system/qwen38-032-test.service.d/zz-dflash2.conf
+systemctl daemon-reload
+rm -f /dev/shm/vllm_offload_*.mmap
+systemctl restart qwen38-032-test
+```
+
+代码补丁无需还原（惰性）。若要彻底移除，`git checkout -- vllm/models/qwen4_exp/nvidia/model.py vllm/model_executor/models/config.py`。
+
+> **测量纪律**：本文所有对比均为同机、同脚本、同日；跨会话的绝对数字不可比。本轮曾误用上一会话的 decode 数字（311 tok/s）作基线，实测同脚本 MTP 仅为 114.1，结论因此反转——记录于此以免复现。
+
 ## License
 
 笔记与脚本 MIT。vLLM（Apache-2.0）、模型权重与作者 fork 的许可证各自适用。
