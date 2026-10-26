@@ -633,3 +633,49 @@ systemctl restart qwen38-032-test
 ## License
 
 笔记与脚本 MIT。vLLM（Apache-2.0）、模型权重与作者 fork 的许可证各自适用。
+## 12. DFlash2 W8A16G128 量化 + KV 池 2.33x（2026-10-26）
+
+11.5 的取舍（DFlash2 付出 KV 池 590K→328K）本轮反转：**DFlash2 现在的池比 MTP 时代还大**。
+
+### 12.1 draft 量化（W8A16G128 GPTQ）
+
+- 算法 GPTQ，校准 = 真实 decode 激活（39 prompts × 3 轮，每模块 19.3 万行 Hessian，只采 decode 步、排除 context-KV 预计算）
+- 格式 `auto_round:auto_gptq`（与主模型同 INC/Marlin 路径），权重误差 mean 0.0080 / max 0.0087
+- **A/B 实测：接受率、decode 吞吐与 BF16 完全一致**（138.0 vs 138.7 tok/s，接受长度 2.53-2.65 vs 2.52-2.65）
+- draft 1.15 GB → 708 MB；工具链 `dflash2-quant/`（捕获→量化→校验→部署）
+
+### 12.2 KV 池：328,829 → 611,669 tokens（2.33x @ 262K）
+
+| 杠杆 | 收益 |
+| --- | --- |
+| W8 draft（权重 -0.49 GiB） | +0.5 GiB KV |
+| `gpu_memory_utilization=0.975` | +1.0 GiB KV（0.99 实测会 OOM，留 1.5 GiB 余量是安全线） |
+| **`VLLM_SW_BLOCK_SIZE=1072`** | **+42% 容量**（见下） |
+
+SWA 块覆盖是核心：draft SWA 组的页（block × 20,480B）主导共享池的 `bytes_per_block`，
+但它每请求只需窗口界定的 ~19 块。1072 = 3216÷3（Triton 16 倍数、整除主块），
+池块大小降为 full-attn 组的 41,988,096B → 块数 203→294，LCM 保持 3216 无膨胀。
+补丁：`patches/dflash2-swa-block-override.patch`（带内核支持 + 整除校验）。
+
+生产 drop-in（`zz-dflash2.conf`）：
+
+```ini
+Environment=QWEN_SPEC=dflash2
+Environment=QWEN_SPEC_TOKENS=4
+Environment=QWEN_SEQS=8
+Environment=QWEN_GPU_MEMORY=0.975
+Environment=QWEN_SPEC_ATTN_BACKEND=TRITON_ATTN
+Environment=QWEN_SPEC_KV_DTYPE=bfloat16
+Environment=QWEN_SPEC_MODEL=/models/incoai-Qwen3.8-Flash-Next-DFlash2-W8A16G128-GPTQ
+Environment=VLLM_SW_BLOCK_SIZE=1072
+```
+
+### 12.3 并发排队实测（4×170K > 池容量）
+
+超容量并发不丢请求，四层机制全验证：等待队列（`Waiting: N`）→ 队首跳过不阻塞
+（`deferred_waiting`，小请求不被大请求卡死）→ KV 卸载（16 GiB CPU 层，每 10s 卸
+700-900MB）→ 抢占（最后手段，实测未触发）。4×170K 全部完成，TTFT 36/67/100/128s
+阶梯准入。观测：`/metrics` 的 `vllm:num_requests_waiting`（分 capacity/deferred）。
+
+> draft KV 保持 bf16：Triton 在 SM89 以下拒绝 fp8 KV；FlashInfer 的 page_size≤64
+> 在 sm80 有池塌陷（11.5 的根因），不可修。

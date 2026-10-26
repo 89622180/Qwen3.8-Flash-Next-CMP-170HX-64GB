@@ -1,0 +1,50 @@
+diff --git a/vllm/model_executor/layers/attention/attention.py b/vllm/model_executor/layers/attention/attention.py
+index bec1856d..21327f79 100644
+--- a/vllm/model_executor/layers/attention/attention.py
++++ b/vllm/model_executor/layers/attention/attention.py
+@@ -656,6 +656,45 @@ class Attention(nn.Module, AttentionLayerBase):
+                 block_size,
+                 kv_cache_spec,
+             )
++            # [pool-opt] VLLM_SW_BLOCK_SIZE: explicit SWA block-size override.
++            # A speculative drafter's SWA page (block * per-token bytes) can
++            # dominate the shared pool's bytes_per_block even though SWA only
++            # holds window-bounded blocks per request. A smaller block that
++            # (a) the backend kernel supports and (b) divides the primary
++            # block size keeps the scheduler LCM unchanged while shrinking
++            # the pool's block size down to the largest full-attention page.
++            import os as _os
++            _sw_env = _os.environ.get("VLLM_SW_BLOCK_SIZE", "")
++            if _sw_env:
++                _sw_override = int(_sw_env)
++                if _sw_override != sw_block_size:
++                    from vllm.v1.attention.backend import MultipleOf as _MO
++                    _supported = self.attn_backend.get_supported_kernel_block_sizes(
++                        kv_cache_spec
++                    )
++                    _kernel_ok = any(
++                        (isinstance(_s, _MO) and _sw_override % _s.base == 0)
++                        or (isinstance(_s, int) and _sw_override == _s)
++                        for _s in _supported
++                    )
++                    if _kernel_ok and block_size % _sw_override == 0:
++                        logger.info_once(
++                            "Overriding SWA block size %d -> %d for %s "
++                            "(VLLM_SW_BLOCK_SIZE)",
++                            sw_block_size,
++                            _sw_override,
++                            self.layer_name,
++                        )
++                        sw_block_size = _sw_override
++                    else:
++                        logger.warning(
++                            "VLLM_SW_BLOCK_SIZE=%d ignored for %s: not a "
++                            "supported kernel block or does not divide "
++                            "block_size=%d",
++                            _sw_override,
++                            self.layer_name,
++                            block_size,
++                        )
+             return SlidingWindowSpec(
+                 block_size=sw_block_size,
+                 num_kv_heads=self.num_kv_heads,

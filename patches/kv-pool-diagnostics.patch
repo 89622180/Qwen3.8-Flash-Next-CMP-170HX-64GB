@@ -1,0 +1,30 @@
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index 03c6c5ff..45ff3f8d 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1622,6 +1622,25 @@ def get_kv_cache_config_from_groups(
+     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
+     validate_kv_cache_layout(layout, kv_cache_groups)
+     bytes_per_block = _get_kv_cache_bytes_per_block(kv_cache_groups, layout)
++    # [poolprobe] one line per group: spec type, block size, page bytes,
++    # per-request max usage bytes and blocks. Startup-only diagnostics.
++    try:
++        for _g in kv_cache_groups:
++            _spec = _g.kv_cache_spec
++            logger.info(
++                "[poolprobe] group layers=%d spec=%s block=%d page=%d "
++                "per_req_bytes=%d per_req_blocks=%d",
++                len(_g.layer_names),
++                type(_spec).__name__,
++                _spec.block_size,
++                _spec.page_size_bytes,
++                _spec.max_memory_usage_bytes(vllm_config),
++                -(-_spec.max_memory_usage_bytes(vllm_config)
++                  // _spec.page_size_bytes),
++            )
++        logger.info("[poolprobe] bytes_per_block=%d", bytes_per_block)
++    except Exception as _e:  # never block startup on diagnostics
++        logger.info("[poolprobe] failed: %s", _e)
+     interleaved_block_stride = bytes_per_block if layout.is_block_outermost else None
+ 
+     num_blocks = available_memory // bytes_per_block
