@@ -65,7 +65,7 @@ torch 2.13.0+cu130 13.0
 > （`ops/qsa.py` 2/2 hunk、`nvidia/qsa.py` hunk #4）。也就是说这个臂的移植成本很低，
 > 大头 `ple_ssd.py`（514 行）和 `ple_ssd_io.c`（247 行）是新增文件，永远干净。
 
-### 三处冲突与判断
+### 四处冲突与判断
 
 **a) `vllm/models/qwen4_exp/nvidia/ops/qsa.py` — kernel 的 fp8 判定**
 
@@ -189,6 +189,8 @@ CT103，DFlash2 k=4，`bench_conc_text.py`（自然中文、2048 in / 256 out、
 
 **定稿：不传任何 extra 参数，DFlash2 k=4，`QWEN_KV_DTYPE=fp8`。**
 
+工具：`benchmarks/decode_long_sample.sh`（6 seed 配对 + 每轮 acc_len / preempt）。
+
 ## 7. CT120（MTP 臂）
 
 同一个 wheel、同一份补丁，容器内 `/root/v33` + `/root/vllm-033work`（`cp -a` 自 CT103，再
@@ -204,7 +206,7 @@ CT103，DFlash2 k=4，`bench_conc_text.py`（自然中文、2048 in / 256 out、
 配对逐轮 2 胜 1 负 → 解码打平；k=4 多 22,138 tokens 的池，并且 k≤4 时 QSA ring 停在
 capacity 8（不需要 0.33 那个放宽循环）。所以 **CT120 降到 `Environment=QWEN_MTP=4`**。
 参照：0.32 时 CT120 的记录是 C1 per-stream 158/161、C2 agg 192.8 —— 本轮 0.33 是 146.5/180.6，
-即 −8 %，在跨天漂移内但方向与 CT103 一致（没有更好）。
+即 −8 %，在跳天漂移内但方向与 CT103 一致（没有更好）。
 
 ## 8. 状态、产物与回滚
 
@@ -212,17 +214,26 @@ capacity 8（不需要 0.33 那个放宽循环）。所以 **CT120 降到 `Envir
   中文 smoke 正常）。CT120 已配好但 **stopped**（一张卡只能一个引擎；CT103 `onboot: 1`，
   CT120 `onboot: 0`，所以主机重启后还是 CT103 拿卡）。两容器 `net0` 现在同为 192.168.9.12，
   同时跑会撞 IP——这是本轮之前就存在的状态，我没有改。
-- 产物：`patches/qwen38-ple-ssd-0.33.patch.gz.b64`（64,097 B 的完整 0.33 臂 diff，
-  sha256 `0d0436af1a1d0085f00c4fb74364a865417b0f880dd94229a7489023ed5c85a0`）、
-  `scripts/install-vllm-033.sh`、`configs/ct103-0.33-dflash2.conf`、`configs/ct120-0.33-mtp.conf`、
-  `benchmarks/decode_long_sample.sh`、`scripts/serve.sh`（新增 `QWEN_EXTRA_ARGS` 透传 + 保留 `QWEN_KV_BYTES`）。
-- 解补丁：
+- 本轮入仓：`scripts/install-vllm-033.sh`、`scripts/serve.sh`（新增 `QWEN_EXTRA_ARGS` 透传，
+  保留 `QWEN_KV_BYTES` 钉池；不线上部署副本 md5 `659c99ca2e39dfea95a2c87f0478dc18`）、
+  `configs/ct103-0.33-dflash2.conf`、`configs/ct120-0.33-mtp.conf`、
+  `benchmarks/decode_long_sample.sh`、本文与 `docs/14600k-pcore-only-recheck.md`。
+- **完整 0.33 臂 diff（64,097 B，23 files/1070+）本轮没有进仓库。** 它在 CT103 的
+  `/root/n1104/ple-033-full.patch`，sha256 `0d0436af1a1d0085f00c4fb74364a865417b0f880dd94229a7489023ed5c85a0`；
+  也可以在 `/root/wt-033`（分支 `ple-033`）上用 `git diff v0.33.0` 重生。
+  我试过用 Contents API 直接上传，但我无法保证 23 KB base64 逐字节不出错，
+  而校验不过就不该留在仓库里，所以先删了。要入仓只需一条命令（今晚容器能连 github.com）：
   ```bash
-  base64 -d patches/qwen38-ple-ssd-0.33.patch.gz.b64 | gunzip > qwen38-ple-ssd-0.33.patch
-  sha256sum qwen38-ple-ssd-0.33.patch   # 0d0436af…
+  # 容器内，带凭据后
+  git -C /root/wt-033 remote add origin https://<token>@github.com/89622180/Qwen3.8-Flash-Next-CMP-170HX-64GB.git
+  cp /root/n1104/ple-033-full.patch <repo>/patches/qwen38-ple-ssd-0.33.patch && git push
   ```
+  在那之前，本文 §2 的四处冲突判定 + `patches/ple_ssd.py` + `patches/*.patch` 已经能手动复现这条臂。
 - 回滚 0.32：删掉 `qwen38-032-test.service.d/zz-v033.conf` → `systemctl daemon-reload` →
   `systemctl restart qwen38-032-test.service`。`/root/vllm-latest`（0.32 臂）全程未改；
   本轮另存了 `scripts/serve.sh.pre-merged-20261104`、`zz-v033.conf.pre-kvfp8-20261103` 两个备份。
 - 已知未做：`flashinfer 0.7.2.post1` / `torch 0.29/2.14` 的 pin 差异没有补齐（盘只够一份 CUDA 栈）；
-  `--help=SpeculativeConfig` 只输出 2 行，FLy/XPress 的官方文案是从源码 docstring 读的，不是 help。
+  `--help=SpeculativeConfig` 只输出 2 行，FLy/XPress 的官方文案是从源码 docstring 读的，不是 help；
+  `draft_lm_head_quantization` 与 `disable_lookahead_block_hashes` 未实测。
+- 本轮顺手修了一个坑：CT103 的 `/models` bind 被 01:20 的自动快照流程卸掉后没挂回，
+  导致 unit 的 `[Unit] ConditionPathExists` 静默拒绝启动（详见另一篇文档 §4）。
