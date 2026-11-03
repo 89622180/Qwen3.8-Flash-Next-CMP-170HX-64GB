@@ -28,18 +28,20 @@ OLD_VENV_SITE=${OLD_VENV_SITE:-/root/vllm-latest/.venv/lib/python3.12/site-packa
 PLE_PATCH=${PLE_PATCH:-/root/n1104/ple-033-full.patch}
 WHEELS=${WHEELS:-/root/wheels33}
 
-mkdir -p "$WHEELS" "$(dirname "$PLE_PATCH")"
+mkdir -p "$WHEELS"
+
+# About $PLE_PATCH: the complete 0.33 arm diff is 64,097 B / 23 files / 1070+,
+# sha256 0d0436af1a1d0085f00c4fb74364a865417b0f880dd94229a7489023ed5c85a0. It is
+# NOT in this repo yet (see docs/vllm-0.33-port-and-decode-sweep.md §8): it lives
+# at CT103:/root/n1104/ple-033-full.patch, and it is regenerable from the branch
+# ple-033 in /root/wt-033 with `git diff v0.33.0`. Point PLE_PATCH at your copy.
+if [ ! -s "$PLE_PATCH" ]; then
+    echo "missing $PLE_PATCH - take it off the farm or rebuild it from branch ple-033"
+    exit 1
+fi
+echo "0d0436af1a1d0085f00c4fb74364a865417b0f880dd94229a7489023ed5c85a0  $PLE_PATCH" | sha256sum -c -
+
 NAME=$(basename "$VLLM_WHEEL_URL")
-
-# The full arm diff ships in this repo base64+gzip, because it is 64 KiB of diff.
-# Decode it if the plain patch is not already there.
-if [ ! -s "$PLE_PATCH" ] && [ -f "$PWD/patches/qwen38-ple-ssd-0.33.patch.gz.b64" ]; then
-    base64 -d "$PWD/patches/qwen38-ple-ssd-0.33.patch.gz.b64" | gunzip > "$PLE_PATCH"
-fi
-if [ -s "$PLE_PATCH" ]; then
-    echo "0d0436af1a1d0085f00c4fb74364a865417b0f880dd94229a7489023ed5c85a0  $PLE_PATCH" | sha256sum -c -
-fi
-
 if [ ! -s "$WHEELS/$NAME" ]; then
     curl -fL --http2 -o "$WHEELS/$NAME.part" "$VLLM_WHEEL_URL"
     echo "$VLLM_WHEEL_SHA  $WHEELS/$NAME.part" | sha256sum -c -
@@ -89,7 +91,7 @@ Now point the unit at it with a drop-in (zz-v033.conf):
 
 QWEN_KV_DTYPE must be fp8, not fp8_e5m2: 0.33's QSA kernel reads an fp8 cache
 only as e4m3 (uint8 byte-decode below sm_89), and asserts float8_e4m3fn for a
-typed cache.
+typed cache (ops/qsa.py:697; _maybe_dequant has no tl.float8e5 branch).
 
 Leave LD_LIBRARY_PATH alone: it still has to name the OLD venv's cu13 lib dir,
 because torch is the old venv's torch.
