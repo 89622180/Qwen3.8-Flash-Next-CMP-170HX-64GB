@@ -88,7 +88,7 @@ fi
 extra=()
 if [[ -n ${QWEN_EXTRA_ARGS:-} ]]; then
     # Space-separated passthrough for plain flags added by a newer engine,
-    # e.g. QWEN_EXTRA_ARGS="--moe-backend marlin". Not for JSON-valued flags.
+    # e.g. QWEN_EXTRA_ARGS="--moe-backend triton". Not for JSON-valued flags.
     read -r -a extra <<< "${QWEN_EXTRA_ARGS}"
 fi
 
