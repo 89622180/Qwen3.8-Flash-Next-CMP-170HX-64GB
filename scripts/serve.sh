@@ -31,6 +31,17 @@ if [[ -n ${QWEN_SPEC:-} && ${QWEN_SPEC} == dflash2 ]]; then
     if [[ -n ${QWEN_SPEC_KV_DTYPE:-} ]]; then
         draft_args+=",\"kv_cache_dtype\":\"${QWEN_SPEC_KV_DTYPE}\""
     fi
+    # 0.33 speculative switches, exposed as plain env vars because systemd + JSON
+    # quoting is a trap. FLy is a LOSSY rejection-sampling variant, not a method.
+    if [[ -n ${QWEN_REJECTION_METHOD:-} ]]; then
+        draft_args+=",\"rejection_sample_method\":\"${QWEN_REJECTION_METHOD}\""
+        if [[ -n ${QWEN_FLY_WINDOW:-} ]]; then
+            draft_args+=",\"fly_window_size\":${QWEN_FLY_WINDOW}"
+        fi
+    fi
+    if [[ -n ${QWEN_LOOKAHEAD_OFF:-} && ${QWEN_LOOKAHEAD_OFF} != 0 ]]; then
+        draft_args+=",\"disable_lookahead_block_hashes\":true"
+    fi
     spec=(--speculative-config "{\"method\":\"dflash\",\"model\":\"${QWEN_SPEC_MODEL:-/models/incoai-Qwen3.8-Flash-Next-DFlash2}\",\"num_speculative_tokens\":${QWEN_SPEC_TOKENS:-7}${draft_args}}")
 elif (( QWEN_MTP > 0 )); then
     spec=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${QWEN_MTP}}")
