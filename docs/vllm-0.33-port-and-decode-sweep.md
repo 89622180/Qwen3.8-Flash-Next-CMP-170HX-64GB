@@ -7,20 +7,29 @@ PLE/n-gram 95.37 GiB 走 SSD，主模型 47.3 GiB 常驻显存。
 ## 0. 结论速览
 
 1. 两个容器都已跑在 **vLLM 0.33.0**（stock wheel + 本仓库臂的 0.33 重移植分支）。
-2. prefill 的真实形状（§4）：不是“回退 17 %”，而是**每请求固定开销 +85 ms（80 → 165 ms）、
-   每 token 边际成本反而 −9 %（208 → 190 µs/tok）**。所以短 prompt（单 chunk）的 TTFT 从
-   0.349 s 变成 0.410 s，而 5k / 10k token 的 prefill 0.33 反而不输／更快（10k：4841 vs 4623 tok/s）。
+2. prefill 的真实形状（§4，9 个 prompt 长度 × 2 重复的 TTFT 全表）：先前那句“每请求固定开销
+   +85 ms”是**只有 3 个点时硬拟直线的产物**。用 9 个点重拟：**截距只差 +8 ms（56.3 → 64.2 ms），
+   斜率 −6 %（212.6 → 200.4 µs/tok）**。差距不是固定成本，是**分段的**——单 chunk 的 prompt 变慢，
+   最坏在 pinned 1,298 tok：0.326 s → 0.398 s（**+72 ms / +22 %**，prefill 3982 → 3261 tok/s）；
+   而 pinned ≥ 2,575 tok（≥2 个 chunk）不再吃亏——2,575 快 17 %（0.677 → 0.560 s）、9,882 快 5 %
+   （2.141 → 2.025 s）、5,022 打平（+0.6 %）。
    单流解码持平（163.8 → 162.8，长样本 159.2），KV 池 557,576 → 553,415 tok（2.13× → 2.11×）。
 3. 0.33 把本臂的 **fp8_e5m2 KV 读取路径删掉了**（§3）。现在走 upstream 为 sm_80 新加的
    uint8 字节解码 e4m3 路径，这是本轮唯一的强制语义变更。
-4. 0.33 新增可调项（`monokernel` / FLy / XPress / `sleep_mode_backend` / `watchdog_config` /
-   `simple_cpu_offload_num_blocks`）**都落不到这条臂**（§5）；新加的 sm_80 FP8 tile 覆盖量出来
-   是三档里最快的，保持默认（§6.5）；V1 model runner 被引擎直接拒（§6.6）。
+4. 0.33 的新增项**逐个启动实测过 11 臂**（全表与判定在 `docs/0.33-new-features-matrix.md`）：
+   只有 `rejection_sample_method=fly` 有信号——交错 A/B-A-B 三对，解码中位数 +8.8 % / +10.9 % /
+   +8.3 %，且不花 prefill、不缩 KV 池。但它是引擎自己打 warning 的 **LOSSY** 验证路径，
+   所以**不默认开启**，只做成一个可选 drop-in（`configs/ct103-0.33-dflash2-fly.conf`）。
+   其余落不到这条臂（`monokernel` / XPress / `sleep_mode_backend` / `watchdog_config` /
+   `simple_cpu_offload_num_blocks`，§5）或被拒（`draft_lm_head_quantization`、
+   `enable_adaptive_verification`、V1 runner，§6.6）。新加的 sm_80 FP8 tile 覆盖量出来是三档里
+   最快的，保持默认（§6.5）。
 5. 解码三臂（长样本、配对 seed）：base 159.2 mean / `--async-scheduling` 152.8 /
    `--moe-backend marlin` 143.7 → **保留 base**；`QWEN_SPEC_TOKENS=3` 因 KV 池掉到 405,131（1.55×）被否。
 6. CT120（MTP 臂）：k=5 与 k=4 解码打平（146.5 vs 146.0），但 k=4 多留 22,138 tokens 的池
    （2.09× vs 2.01×），所以 **降到 k=4**。
-7. **要“预处理”拉回来的话，目标应该是那 85 ms 的固定开销，不是 kernel 吞吐**：kernel 已经更快了。
+7. **prefill 还想拉的话，只剩 pinned ≈0.7k–1.3k 那一格**：长 prompt 0.33 已经更快，固定开销
+   也只有 +8 ms，所以目标不再是 kernel 吞吐，而是那一格单 chunk 路径上多出来的 72 ms（未归因，§4）。
 
 ## 1. 装了什么
 
@@ -123,53 +132,88 @@ AssertionError
 处理：`QWEN_KV_DTYPE=fp8`，走 upstream 为 sm_80 准备的 uint8 字节解码 e4m3 路径。这一步同时
 改了数值路径（e4m3 vs e5m2），所以 §4 的对比不是纯版本对比——标清这一点，不假装。
 
-## 4. prefill 拆解：固定开销 vs 边际成本（同会话、同脚本、配对 seed）
+## 4. prefill 全长度扫描：9 格 × 2 重复，两版同会话
 
-之前只量了 2048-token 那一格（实际有效 prompt 只有 ~1289 token，属于单 chunk）就下了
-“prefill −17.5 %”的结论，太粗。本轮把三臂补齐到 1.3k / 5k / 10k 三格，并回到 0.32 重测：
+先前只量了 2048-request 那一格，又用 1.3k / 5k / 10k 三个点拟合直线，得出“固定开销 +85 ms、
+边际 −9 %”。**那个结论是拟合产物**：三点里恰好一格是回退、一格打平、一格领先，硬拟一条直线
+就会把它翻译成“截距涨、斜率降”。本轮回到 0.32 把 9 个 prompt 长度各跑 2 遍（C=1，
+`outsweep032` / `outsweep`，seed 5101/5102，`cached=0` ⇒ 每格都是冷前缀），两遍都列在上表，
+比较时取每臂两遍里**较快的一遍**（两臂同样处理，不偏袒；见下面的星号说明）。
+`pin` = 服务端上报的实际 prompt tokens（>512 的格约为请求长度的 0.61–0.64×）。
 
-| 有效 prompt | 0.32.1.dev+ple (fp8_e5m2) | 0.33.0+ple (fp8 e4m3) | TTFT 0.32 → 0.33 |
-|---|---:|---:|---|
-| ~1,289 tok | 3716 tok/s | 3122 tok/s | 0.349 s → 0.410 s |
-| ~5,020 tok | 4580 tok/s | 4625 tok/s | 1.097 s → 1.090 s |
-| ~9,880 tok | 4623 tok/s | **4841 tok/s** | 2.137 s → 2.041 s |
+| 请求 tok | pin tok | TTFT 0.32（两遍） | TTFT 0.33（两遍） | 快的一遍 0.32 → 0.33 | Δ | prefill tok/s 0.32 → 0.33 |
+|---|---|---|---|---|---|---|
+| 8 | 8 / 8 | 0.036 / 0.036 | 0.038 / 0.038 | 0.036 → 0.038 s | **+2 ms（+5.6 %）** | 222 → 211 |
+| 32 | 32 / 32 | 0.039 / 0.041 | 0.043 / 0.125 | 0.039 → 0.043 s | **+4 ms（+10.3 %）** | 821 → 744 |
+| 128 | 128 / 128 | 0.064 / 0.065 | 0.069 / 0.127 | 0.064 → 0.069 s | **+5 ms（+7.8 %）** | 2000 → 1855 |
+| 512 | 329 / 332 | 0.132 / 0.133 | 0.115 / 0.134 | 0.132 → 0.115 s | **−17 ms（−12.9 %）** | 2492 → 2887 |
+| 1024 | 649 / 654 | 0.224 / 0.225 | 0.226 / 0.227 | 0.224 → 0.226 s | +2 ms（+0.9 %） | 2897 → 2894 |
+| 2048 | 1289 / 1298 | 0.326 / 0.329 | 0.398 / 0.414 | 0.326 → 0.398 s | **+72 ms（+22.1 %）** | 3982 → 3261 |
+| 4096 | 2575 / 2575 | 0.677 / 0.680 | 0.560 / 0.562 | 0.677 → 0.560 s | **−117 ms（−17.3 %）** | 3804 → 4598 |
+| 8192 | 5022 / 5022 | 1.090 / 1.103 | 1.097 / 1.111 | 1.090 → 1.097 s | +7 ms（+0.6 %） | 4607 → 4578 |
+| 16384 | 9820 / 9882 | 2.141 / 2.141 | 2.025 / 2.058 | 2.141 → 2.025 s | **−116 ms（−5.4 %）** | 4587 → 4880 |
 
-把 TTFT 对 prompt 长度拟合一次，形状就拆开了：
+用这 9 个点重新拟合 TTFT = 截距 + 斜率 × pin：
 
-| | 固定开销（截距） | 每 token 边际成本（斜率） |
-|---|---:|---:|
-| 0.32 | 81 ms | 208 µs/tok |
-| 0.33 | **165 ms** | **190 µs/tok（−9 %）** |
+| 拟合范围 | 0.32 截距 / 斜率 | 0.33 截距 / 斜率 | 残差 |
+|---|---|---|---|
+| 全部 9 格 | 56.3 ms / 212.6 µs·tok⁻¹（4704 tok/s） | 64.2 ms / **200.4 µs·tok⁻¹（4991 tok/s）** | max ±74 ms，rms 32 ms |
+| 仅 pin ≥ 1289 | 81.5 ms / 208.8（4789） | 112.0 ms / **193.4（5170）** | max ±58 ms |
+| 仅 pin 329–1298 | 80.2 ms / 193.9（5157） | 26.1 ms / **289.3（3457）** | max ≤18 ms，rms ≤13 ms |
 
-所以“预处理差距”不是吞吐回退，而是**每请求多了 ≈85 ms 的固定成本**：短 prompt 全额付这笔钱，
-长 prompt 被边际收益抵掉甚至反超。CT120 同理（它的 1.3k 格 0.33 实测 3280-3351，因为它是 MTP
-草案、没有 DF2 的 candidate-head 那一段）。
+**所以“+85 ms 固定开销”不成立**——全域拟合的截距只差 8 ms。真正成立的是分段：
 
-**本轮没找到的东西，也说清：**这 85 ms 目仍未归因。已排除的候选：MoE 后端（`--moe-backend marlin`
-的 1.3k prefill = 3088，与 base 3122 同）、`--async-scheduling`（异步臂 1.3k prefill 3134 vs
-base 3122，没变）、FP8 tile 覆盖（§6.5）、V1 runner（§6.6，被拒）。下一步如果要拿回那 85 ms，
-得上 profiler（在 `qsa_sparse_paged_attention` / PLE prefetch / 调度入队三处计时），而不是改 flag。
+- 0.32 在 329–1298 这段是干净的直线（rms 13 ms，5157 tok/s），0.33 同一段只有 3457 tok/s，
+  即**单 chunk 区间掉速 ~33 %**；
+- 一旦进入多 chunk（pin ≥ 2575）0.33 不再吃亏：2575 那格 TTFT 降 17.3 %（3804 → 4598 tok/s），
+  9882 降 5.4 %（4587 → 4880），5022 打平（+0.6 %）；
+- 两版在 32 → 9882 的**总平均边际吞吐几乎相同**（4748 vs 4734 tok/s）。
+
+**取“两遍里较快的一遍”这件事本身要打个星号。** 0.32 的两遍在小 prompt 上彼此一致
+（32 tok：0.039 / 0.041；128 tok：0.064 / 0.065），而 0.33 的 **seed 5101 那两格慢 3 倍**
+（32 tok：0.125 vs 0.043；128 tok：0.127 vs 0.069；512 tok：0.134 vs 0.115）。同一版本、同一配置、
+只差 seed ⇒ 这是 0.33 臂上真实存在的**首过/抖动代价**（8 tok 那格两遍都是 0.038，所以不是纯
+时钟爬坡）。取 min 把它从表里抹掉了，但**生产上会真的遇到**。这条只有观察，没做单独实验，
+也不打算据此下结论。
+
+也就是说 0.33 的 prefill 不是“慢 17 %”，是**把成本挪了位置**：pinned 0.65k–1.3k 这一段（代码
+补全、短问答常用的量级）实打实多等 +2 → +72 ms，长上下文反而更快。你原来问的“预处理差距太大”
+只对这一格成立，其余格是赚的。
+
+**仍未归因，也说清：**已排除的候选——MoE 后端（`--moe-backend marlin` 1.3k = 3088 vs base 3122）、
+`--async-scheduling`（3134 vs 3122）、FP8 tile 覆盖（§6.5：128,4 / table / 64,4 = 3122 / 3165 / 3082，
+三档都在 3.1k 附近）、V1 runner（§6.6，被引擎拒）。一个只能观察到的相关性：0.33 在单 chunk 段
+掉速、多 chunk 段反超，而两版的 chunk 边界同为 `--max-num-batched-tokens 2048`，所以差异在
+**chunk 内的 kernel 选择/M 分派**，不在调度次数。要拿回这 72 ms 得上 profiler（在
+`qsa_sparse_paged_attention` / PLE prefetch / 调度入队三处计时），改 flag 已经证明无效。
+另一个必须记住的混淆项：§3 的 e5m2 → e4m3 是**跟着版本一起被强制换掉的数值路径**，所以这张表
+量的是“0.33+fp8”对“0.32+e5m2”，不是纯版本对比。
 
 其他 0.32 vs 0.33 的配对量（CT103，DFlash2 k=4，2048-in/256-out 短 ladder）：C1 单流 decode
 163.8 → 162.8，C2 聚合 197.1 → 187.3，C4 301.8 → 287.0，acc_len 2.80-3.12 → 2.98-3.11，
 `preempt=0`，GPU KV 557,576 → 553,415 tok，util 等效 0.9542 → 0.9523（graph 估算多占 ~0.19 GiB）。
 
-## 5. 0.33 新特性逐项，以及为什么落不到这条臂
+## 5. 0.33 新特性逐项：diff 出的字段 + 11 臂启动实测的判定
 
 不是看 release note，是把两版 dataclass 字段直接 diff 出来（`EngineArgs`、`CompilationConfig`、
 `CacheConfig`、`SpeculativeConfig`、`KernelConfig`）：
 
 | 新增字段 | 属于 | 本臂能否用 |
 |---|---|---|
-| `monokernel` | EngineArgs + KernelConfig | **不能**。`grep -rn monokernel vllm/` 只命中 `vllm/models/deepseek_v41/amd/**`，判定里 `not current_platform.is_rocm()` 直接返回——这是 gfx942 的 DeepSeek 融合内核开关 |
+| `monokernel` | EngineArgs + KernelConfig | **能启动，但完全惰性**。`grep -rn monokernel vllm/` 只命中 `vllm/models/deepseek_v41/amd/**`，判定里 `not current_platform.is_rocm()` 直接返回——这是 gfx942 的 DeepSeek 融合内核开关。实测臂 decode 140.3 / 139.4，与 base 同档 |
 | `sleep_mode_backend` | EngineArgs | 不能（显存休眠，与吞名无关） |
 | `watchdog_config` | EngineArgs | 不能（可靠性） |
 | `simple_cpu_offload_num_blocks` | CacheConfig | 用不上。本臂走 `OffloadingConnector` + `TieringOffloadingSpec`（16 GiB CPU 层），不是 `SimpleCPUOffloadConnector` |
-| `fly_*` | SpeculativeConfig | **能装但不该用**：FLy 是独立 method，引擎自己打 `FLy verification is a lossy speculative decoding method and may degrade model outputs`，还要求 `num_speculative_tokens ≥ 2`。DFlash2 不是 FLy |
+| `rejection_sample_method=fly`（+ `fly_window_size`） | SpeculativeConfig | **能用，而且是本轮唯一有信号的项**。它不是 method，是**验证期的有损拒绝采样变体**（挂在现有 DF2 草案上）。交错 A/B-A-B 三对：解码中位数 **+8.8 % / +10.9 % / +8.3 %**，prefill 与 KV 池零代价（553,415 tok / 2.11× 不变）。引擎自己打 warning：`FLy verification is a lossy speculative decoding method and may degrade model outputs`；10 题质量探子两臂都 8/10，但只有 2/10 的回答逐字节相同。**因为“分数没降”不等于“输出没变”，shipped 配置不开**，做成可选 drop-in `configs/ct103-0.33-dflash2-fly.conf` |
 | `xpress_topc` | SpeculativeConfig | 不能。`speculative.py:1620` 直接 `raise ValueError("xpress_topc is only supported by XPress")` |
-| `draft_lm_head_quantization` | SpeculativeConfig | 未测（gate 文案是 “not supported for method …”，且 sm_80 上没有 fp8/nvfp4 硬件路径，要真启动才能判） |
-| `disable_lookahead_block_hashes` | SpeculativeConfig | 未测（只在 `config/vllm.py` 里出现，看不出对本臂的作用面） |
+| `draft_lm_head_quantization` | SpeculativeConfig | **dflash 臂实测被拒**（12 s 起不来：`draft_lm_head_quantization is not supported for method 'dflash'`）。gate 列表是 eagle / eagle3 / **mtp**，所以理论上 CT120 那条 MTP 臂可以试，本轮没量；另外 sm_80 本来就没有 fp8/nvfp4 硬件路径 |
+| `disable_lookahead_block_hashes` | SpeculativeConfig | **没有提升**：关掉后 decode 138.3 / median 135.3（base 158.5 / 138.9）。median 基本打平、mean 更低，而本 harness 的分辨率不到 20 %（矩阵 §3），所以结论是**没有理由开**，保持默认 |
+| `enable_adaptive_verification` | SpeculativeConfig | 实测被拒（12 s）：只对 `method="dspark"` 生效 |
 | `CompilationConfig` | — | **字段零变化**，所以 0.32 那套 cudagraph 结论（capture sizes 数的是 token）在 0.33 原样成立 |
+
+上表只列 diff 出来的字段；**11 臂逐个启动的实测判定（含 hybrid KV manager、cascade attention、
+cooperative indexer、triton MoE、mamba stochastic rounding、monokernel）在
+`docs/0.33-new-features-matrix.md`**，那一轮的唯一收获就是 FLy。
 
 引擎侧的实际差异只有两条（日志读到）：`Using HummingIndexedExperts Humming MoE backend`，和 §3
 的 fp8 读取路径重写。V2 model runner **不是**差异：0.32 的日志里也有（journal 计数 9 vs 3）。
@@ -195,6 +239,12 @@ base 3122，没变）、FP8 tile 覆盖（§6.5）、V1 runner（§6.6，被拒�
 **定稿：不传任何 extra 参数，DFlash2 k=4，`QWEN_KV_DTYPE=fp8`。** 工具：
 `benchmarks/decode_long_sample.sh`（6 seed 配对 + 每轮 acc_len / preempt）。
 
+> 补一句诊断（第五轮才搞清楚，见 `docs/0.33-new-features-matrix.md` §3）：这个 harness 的
+> decode 是**双峰**的——acc_len 4.93–4.97 的一簇跑 240–268 tok/s，acc_len 2.45–3.2 的一簇跑
+> 126–180 tok/s，落哪一簇取决于贪心有没有锁进重复循环（提示词是同一句话循环 12 遍 +
+> `ignore_eos`），**与配置无关**。所以本表里 20 % 以内的差都判不出来，包括前面几个臂的
+> “+3 % / −5 %”。要拿可信数字得换非重复的自然提示词，或按 acc_len 分层只取非循环 run。
+
 ### 6.5 新加的 sm_80 FP8 tile 覆盖：量了，保持默认
 
 0.33 在 QSA 里新增一行（0.32 树里 `grep -c _is_sm80` = **0**，确认是新东西）：
@@ -206,8 +256,10 @@ if is_fp8 and _is_sm80():
     BLOCK_N, num_warps = 128, 4
 ```
 
-注释自己承认这是在 A100 上量出来的。我把它改成 `Q38_SM80_FP8_TILES` 环境变量控制（默认
-`128,4` = 上游行为，`<n>,<w>` = 换 tile，`table` = 关掉覆盖、用 GB300 表选的值），然后三臂：
+注释自己承认这是在 A100 上量出来的——**这不是“别人的卡”的借口**：CMP 170HX 就是 GA100，
+sm_80 与 A100 同核，所以上游这条覆盖对我们是**同架构调优**，不是外推。我把它改成
+`Q38_SM80_FP8_TILES` 环境变量控制（默认 `128,4` = 上游行为，`<n>,<w>` = 换 tile，
+`table` = 关掉覆盖、用 GB300 表选的值），然后三臂：
 
 | 设置 | 1.3k prefill | 5k prefill | 10k prefill | decode mean/median |
 |---|---:|---:|---:|---|
@@ -254,10 +306,14 @@ CT120 的 `perf.conf` 用 `QWEN_KV_BYTES=10200547328` 把池钉在 9.50 GiB，�
   KV 553,415 tok / 2.11×，0 条错误）。CT120 已配好但 **stopped**（一张卡只能一个引擎；
   CT103 `onboot: 1`、CT120 `onboot: 0`，所以主机重启后还是 CT103 拿卡）。两容器 `net0` 同为
   192.168.9.12，同时跑会撞 IP——这是本轮之前就存在的状态，我没改。
-- 本轮入仓：`scripts/install-vllm-033.sh`、`scripts/serve.sh`（新增 `QWEN_EXTRA_ARGS` 透传，
-  保留 `QWEN_KV_BYTES` 钉池；与线上副本 md5 一致 `659c99ca2e39dfea95a2c87f0478dc18`）、
-  `configs/ct103-0.33-dflash2.conf`、`configs/ct120-0.33-mtp.conf`、`benchmarks/decode_long_sample.sh`、
-  本文与 `docs/14600k-pcore-only-recheck.md`。
+- 本轮入仓：`scripts/install-vllm-033.sh`、`scripts/serve.sh`（`QWEN_EXTRA_ARGS` 透传 + 保留
+  `QWEN_KV_BYTES` 钉池 + 第五轮补的 `spec_switches()`：**FLy / fly_window / lookahead-off 三个
+  0.33 开关现在对 dflash 和 mtp 两条分支都生效**；线上 CT103 与 CT120 的副本 md5 相同
+  `f57fe6bad65c74a7864756e936884d35`，仓库副本按同一 md5 校验过）、
+  `configs/ct103-0.33-dflash2.conf`、`configs/ct120-0.33-mtp.conf`、
+  `configs/ct103-0.33-dflash2-fly.conf`、`benchmarks/decode_long_sample.sh`、
+  `benchmarks/qa_lossy_check.sh`、本文与 `docs/14600k-pcore-only-recheck.md`、
+  `docs/0.33-new-features-matrix.md`。
 - **完整的 0.33 臂 diff（64,097 B，23 files/1070+）本轮没有进仓库。** 它在 CT103 的
   `/root/n1104/ple-033-full.patch`，sha256 `0d0436af1a1d0085f00c4fb74364a865417b0f880dd94229a7489023ed5c85a0`；
   也可在 `/root/wt-033`（分支 `ple-033`）用 `git diff v0.33.0` 重生。我试过用 Contents API 直接
@@ -272,9 +328,13 @@ CT120 的 `perf.conf` 用 `QWEN_KV_BYTES=10200547328` 把池钉在 9.50 GiB，�
 - 回滚 0.32：删掉 `qwen38-032-test.service.d/zz-v033.conf` → `systemctl daemon-reload` →
   `systemctl restart qwen38-032-test.service`。本轮已实际走过一次这一路径（§4 的 0.32 对照
   就是这么测的，然后恢复回 0.33），所以回滚是验过的。`/root/vllm-latest`（0.32 臂）全程未改；
-  另有备份 `scripts/serve.sh.pre-merged-20261104`、`zz-v033.conf.pre-kvfp8-20261103`、
-  `/root/n1104/qsa_ops.py.pre-sm80tiles-20261104`。
+  另有备份 `scripts/serve.sh.pre-merged-20261104`、`scripts/serve.sh.pre-spec-switches-20261104`、
+  `scripts/serve.sh.pre-specfn-20261104`（CT103 与 CT120 各有一份）、
+  `zz-v033.conf.pre-kvfp8-20261103`、`/root/n1104/qsa_ops.py.pre-sm80tiles-20261104`。
 - 已知未做：`flashinfer 0.7.2.post1` / `torch 0.29/2.14` 的 pin 没补齐（盘只够一份 CUDA 栈）；
-  `draft_lm_head_quantization` 与 `disable_lookahead_block_hashes` 未实测；那 85 ms 固定开销未归因。
+  `draft_lm_head_quantization` 在 **MTP 臂**（CT120）上没试过——0.33 的 gate 列表里含 mtp，
+  这条臂可能是唯一能吃到它的地方；FLy 同样**只在 DFlash2 臂量过**，CT120 上两行就能试
+  （`Environment=QWEN_REJECTION_METHOD=fly` + `Environment=QWEN_FLY_WINDOW=2`），但需要把卡从
+  CT103 手上换过去，本轮没做；pinned 0.7k–1.3k 那一格多出来的 72 ms 未归因。
 - 本轮顺手修了一个坑：CT103 的 `/models` bind 被 01:20 的自动快照流程卸掉后没挂回，
   导致 unit 的 `[Unit] ConditionPathExists` 静默拒绝启动（详见另一篇文档 §4）。
