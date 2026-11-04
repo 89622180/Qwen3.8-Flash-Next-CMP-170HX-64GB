@@ -17,13 +17,17 @@ PLE/n-gram 95.37 GiB 走 SSD，主模型 47.3 GiB 常驻显存。
 3. 0.33 把本臂的 **fp8_e5m2 KV 读取路径删掉了**（§3）。现在走 upstream 为 sm_80 新加的
    uint8 字节解码 e4m3 路径，这是本轮唯一的强制语义变更。
 4. 0.33 的新增项**逐个启动实测过 11 臂**（全表与判定在 `docs/0.33-new-features-matrix.md`）：
-   只有 `rejection_sample_method=fly` 有信号——交错 A/B-A-B 三对，解码中位数 +8.8 % / +10.9 % /
-   +8.3 %，且不花 prefill、不缩 KV 池。但它是引擎自己打 warning 的 **LOSSY** 验证路径，
-   所以**不默认开启**，只做成一个可选 drop-in（`configs/ct103-0.33-dflash2-fly.conf`）。
+   只有 `rejection_sample_method=fly` 有信号——DFlash2 臂交错 A/B-A-B 三对，解码中位数
+   +8.8 % / +10.9 % / +8.3 %；第六轮在 **CT120 的 MTP 臂**复测更大（+15.1 / +16.0 / +29.9 %，
+   池化 **+18.8 %**，见 `docs/0.33-features-on-ct120-mtp.md`）。两臂都不花 prefill、不缩 KV 池。
+   但它是引擎自己打 warning 的 **LOSSY** 验证路径（CT103 上 10 题只 2 题逐字节相同，
+   CT120 上只 3 题相同），所以**不默认开启**，只做可选 drop-in
+   （`configs/ct103-0.33-dflash2-fly.conf`、`configs/ct120-0.33-mtp-fly.conf`）。
    其余落不到这条臂（`monokernel` / XPress / `sleep_mode_backend` / `watchdog_config` /
-   `simple_cpu_offload_num_blocks`，§5）或被拒（`draft_lm_head_quantization`、
-   `enable_adaptive_verification`、V1 runner，§6.6）。新加的 sm_80 FP8 tile 覆盖量出来是三档里
-   最快的，保持默认（§6.5）。
+   `simple_cpu_offload_num_blocks`，§5）；`draft_lm_head_quantization` 与
+   `enable_adaptive_verification` **在 0.33 里根本不是 CLI flag**（argparse 报
+   `unrecognized arguments`），前者走 JSON 在 MTP 臂过了 gate 但死在 sm_80 的 FP8 kernel 要求（§5）。
+   新加的 sm_80 FP8 tile 覆盖量出来是三档里最快的，保持默认（§6.5）。
 5. 解码三臂（长样本、配对 seed）：base 159.2 mean / `--async-scheduling` 152.8 /
    `--moe-backend marlin` 143.7 → **保留 base**；`QWEN_SPEC_TOKENS=3` 因 KV 池掉到 405,131（1.55×）被否。
 6. CT120（MTP 臂）：k=5 与 k=4 解码打平（146.5 vs 146.0），但 k=4 多留 22,138 tokens 的池
@@ -196,20 +200,30 @@ AssertionError
 ## 5. 0.33 新特性逐项：diff 出的字段 + 11 臂启动实测的判定
 
 不是看 release note，是把两版 dataclass 字段直接 diff 出来（`EngineArgs`、`CompilationConfig`、
-`CacheConfig`、`SpeculativeConfig`、`KernelConfig`）：
+`CacheConfig`、`SpeculativeConfig`、`KernelConfig`），再逐个占一次真启动验证。
+**完整矩阵在 `docs/0.33-new-features-matrix.md`**，这里只留字段面的判定：
 
 | 新增字段 | 属于 | 本臂能否用 |
 |---|---|---|
 | `monokernel` | EngineArgs + KernelConfig | **能启动，但完全惰性**。`grep -rn monokernel vllm/` 只命中 `vllm/models/deepseek_v41/amd/**`，判定里 `not current_platform.is_rocm()` 直接返回——这是 gfx942 的 DeepSeek 融合内核开关。实测臂 decode 140.3 / 139.4，与 base 同档 |
-| `sleep_mode_backend` | EngineArgs | 不能（显存休眠，与吞名无关） |
+| `sleep_mode_backend` | EngineArgs | 不能（显存休眠，与本臂瓶颈无关） |
 | `watchdog_config` | EngineArgs | 不能（可靠性） |
 | `simple_cpu_offload_num_blocks` | CacheConfig | 用不上。本臂走 `OffloadingConnector` + `TieringOffloadingSpec`（16 GiB CPU 层），不是 `SimpleCPUOffloadConnector` |
-| `rejection_sample_method=fly`（+ `fly_window_size`） | SpeculativeConfig | **能用，而且是本轮唯一有信号的项**。它不是 method，是**验证期的有损拒绝采样变体**（挂在现有 DF2 草案上）。交错 A/B-A-B 三对：解码中位数 **+8.8 % / +10.9 % / +8.3 %**，prefill 与 KV 池零代价（553,415 tok / 2.11× 不变）。引擎自己打 warning：`FLy verification is a lossy speculative decoding method and may degrade model outputs`；10 题质量探子两臂都 8/10，但只有 2/10 的回答逐字节相同。**因为“分数没降”不等于“输出没变”，shipped 配置不开**，做成可选 drop-in `configs/ct103-0.33-dflash2-fly.conf` |
+| `rejection_sample_method` / `fly_window_size` | SpeculativeConfig | **能用，唯一有信号的新项**，但 LOSSY，见下 |
 | `xpress_topc` | SpeculativeConfig | 不能。`speculative.py:1620` 直接 `raise ValueError("xpress_topc is only supported by XPress")` |
-| `draft_lm_head_quantization` | SpeculativeConfig | **dflash 臂实测被拒**（12 s 起不来：`draft_lm_head_quantization is not supported for method 'dflash'`）。gate 列表是 eagle / eagle3 / **mtp**，所以理论上 CT120 那条 MTP 臂可以试，本轮没量；另外 sm_80 本来就没有 fp8/nvfp4 硬件路径 |
+| `draft_lm_head_quantization` | SpeculativeConfig | **不是 CLI flag**（整棵树 `grep 'draft-lm-head'` 零命中）：第五轮按 `--draft-lm-head-quantization fp8` 传，两容器的启动日志都是 `vllm: error: unrecognized arguments`，所以我原先写的“引擎按 method 拒”是**源码文案不是日志**（第六轮更正，见 `docs/0.33-features-on-ct120-mtp.md` §0/§3）。字段只能走 `--speculative-config` JSON（`serve.sh` 现在有 `QWEN_DRAFT_LM_HEAD`）；MTP 臂**过了 gate**，2 min 41 s 后死在建权重：`FP8 PTPC online quant requires a kernel that honors per-token activation quantization; MarlinFP8 is W8A16 weight-only. Requires SM89+ for Cutlass FP8 or ROCm MI3xx for rowwise scaled_mm.` ⇒ **这张卡吃不到它，与配置无关** |
 | `disable_lookahead_block_hashes` | SpeculativeConfig | **没有提升**：关掉后 decode 138.3 / median 135.3（base 158.5 / 138.9）。median 基本打平、mean 更低，而本 harness 的分辨率不到 20 %（矩阵 §3），所以结论是**没有理由开**，保持默认 |
-| `enable_adaptive_verification` | SpeculativeConfig | 实测被拒（12 s）：只对 `method="dspark"` 生效 |
+| `enable_adaptive_verification` | SpeculativeConfig | 同样**不是 CLI flag**（`unrecognized arguments: --enable-adaptive-verification`），源码里的 `dspark` gate 从没被执行到 |
 | `CompilationConfig` | — | **字段零变化**，所以 0.32 那套 cudagraph 结论（capture sizes 数的是 token）在 0.33 原样成立 |
+
+FLy 不是 method，是挂在现有草案上的**验证期有损拒绝采样变体**（`fly` 出现在
+`rejection_sample_method` 的 Literal 里，和 `standard` / `synthetic` / `block` 并列），所以
+DF2 臂能装。交错 A-B-A-B 三对给 **+8.8 % / +10.9 % / +8.3 %**（中位数，剔除进循环的 run），
+prefill 与 KV 池零代价。要开就一个 drop-in：`configs/ct103-0.33-dflash2-fly.conf`
+（`QWEN_REJECTION_METHOD=fly` + `QWEN_FLY_WINDOW=2`，`serve.sh` 已接）。**但它是 lossy**：
+引擎自己打 warning，10 题事实探子两臂同分 8/10，可 10 答里只有 2 答逐字节相同——
+“分数没降”不等于“输出没变”，所以 shipped 配置不开。第六轮在 CT120 的 MTP 臂上量到 **+18.8 %**
+（见 `docs/0.33-features-on-ct120-mtp.md`），性质一样。
 
 上表只列 diff 出来的字段；**11 臂逐个启动的实测判定（含 hybrid KV manager、cascade attention、
 cooperative indexer、triton MoE、mamba stochastic rounding、monokernel）在
@@ -300,20 +314,43 @@ CT120 的 `perf.conf` 用 `QWEN_KV_BYTES=10200547328` 把池钉在 9.50 GiB，�
 配对逐轮 2 胜 1 负 → 解码打平；k=4 多 22,138 tokens 的池，且 k≤4 时 QSA ring 停在 capacity 8
 （不需要 0.33 那个放宽循环）。所以 **CT120 降到 `Environment=QWEN_MTP=4`**。
 
+### 7.5 第六轮：把卡倒到 CT120，复测 FLy 与 draft_lm_head
+
+细节在 `docs/0.33-features-on-ct120-mtp.md`，这里只留结论：
+
+- **FLy 在 MTP 臂上更强**：交错三对（每臂一次真启动，6 配对 seed × 1024 输出）解码中位
+  **+15.1 % / +16.0 % / +29.9 %**，池化 162.9 vs 137.2 = **+18.8 %**，逐 seed 配对 fly 赢 16/18；
+  按 acc_len ≥ 4.1 把两臂的饱和 run 都剔掉再比仍是 **+18.7 %**。acc_len mean 3.023 → 3.739。
+  prefill 与 KV 池零代价（每臂都是 `548,787 tok / 2.09×`，`preempt=0`）。
+  这条臂没碰到第四/五轮那个循环吸引子（acc_len 全程 ≤ 4.43），所以这组数比 DF2 那组干净。
+  **性质仍然是 lossy**：10 题探子 8/10 → 9/10，但 10 答只 3 答逐字节相同。
+- **`draft_lm_head_quantization` 吃不到**：走 JSON 进得去（`serve.sh` 的 `QWEN_DRAFT_LM_HEAD`），
+  MTP 过 method gate，但建权重时 `MarlinFP8` 是 W8A16 weight-only，不满足 FP8 PTPC 的
+  per-token 激活契约，要求 SM89+（原文见 §5 那行）。`nvfp4` 是 Blackwell 路径，更不可能。
+- 顺带两条 0.33 的日志事实：`--mamba-cache-mode` **在 0.33 已废弃且无效果**（本臂还在传，
+  改动会动 shipped argv，本轮只记录）；MTP 每次启动都 warning `num_speculative_tokens > 1
+  will run multiple times of forward on same MTP layer … may result in lower acceptance rate`，
+  这与标准臂里 acc_len 掉到 1.90–2.44 的那些 run 是同一件事。
+
 ## 8. 状态、产物与回滚
 
-- **CT103 running，vLLM 0.33.0，:8000 提供 `Qwen3.8-Flash-Next`**（`MainPID == :8000 owner`，
-  KV 553,415 tok / 2.11×，0 条错误）。CT120 已配好但 **stopped**（一张卡只能一个引擎；
-  CT103 `onboot: 1`、CT120 `onboot: 0`，所以主机重启后还是 CT103 拿卡）。两容器 `net0` 同为
-  192.168.9.12，同时跑会撞 IP——这是本轮之前就存在的状态，我没改。
+- **当前拿卡的是 CT120**（第六轮倒卡）：vLLM 0.33.0，`MainPID == :8000 owner`，health 200，
+  argv `{"method":"mtp","num_speculative_tokens":4}` + `--kv-cache-dtype fp8`，**标准验证、无 fly**，
+  KV 548,787 tok / 2.09×，drop-in 只剩 `perf.conf` + `zz-v033.conf`。
+  **CT103 连容器一起停了**（两容器 `net0` 同为 192.168.9.12，同时起会撞 IP；这是本轮之前就存在
+  的状态，我没改）。CT103 的 unit 仍是 `enabled` + `onboot: 1`、CT120 `onboot: 0`，所以**主机重启后
+  卡会回到 CT103**；要立刻换回去：CT120 `systemctl stop qwen38-032-test.service` 释放显存，再
+  `pct start 103`。
 - 本轮入仓：`scripts/install-vllm-033.sh`、`scripts/serve.sh`（`QWEN_EXTRA_ARGS` 透传 + 保留
-  `QWEN_KV_BYTES` 钉池 + 第五轮补的 `spec_switches()`：**FLy / fly_window / lookahead-off 三个
-  0.33 开关现在对 dflash 和 mtp 两条分支都生效**；线上 CT103 与 CT120 的副本 md5 相同
-  `f57fe6bad65c74a7864756e936884d35`，仓库副本按同一 md5 校验过）、
+  `QWEN_KV_BYTES` 钉池 + `spec_switches()`：**FLy / fly_window / lookahead-off / draft_lm_head
+  四个开关对 dflash 和 mtp 两条分支都生效**；线上 CT103 与 CT120 的副本 md5 相同
+  `31bdaa2ae90b1a1b47eb14159efdd771`，仓库副本按同一 md5 校验过；默认一个都不设 ⇒ argv 与本轮之前
+  完全相同，用 `QWEN_PRINT_COMMAND=1` 对拍过）、
   `configs/ct103-0.33-dflash2.conf`、`configs/ct120-0.33-mtp.conf`、
-  `configs/ct103-0.33-dflash2-fly.conf`、`benchmarks/decode_long_sample.sh`、
-  `benchmarks/qa_lossy_check.sh`、本文与 `docs/14600k-pcore-only-recheck.md`、
-  `docs/0.33-new-features-matrix.md`。
+  `configs/ct103-0.33-dflash2-fly.conf`、`configs/ct120-0.33-mtp-fly.conf`、
+  `benchmarks/decode_long_sample.sh`、`benchmarks/qa_lossy_check.sh`、本文与
+  `docs/14600k-pcore-only-recheck.md`、`docs/0.33-new-features-matrix.md`、
+  `docs/0.33-features-on-ct120-mtp.md`。
 - **完整的 0.33 臂 diff（64,097 B，23 files/1070+）本轮没有进仓库。** 它在 CT103 的
   `/root/n1104/ple-033-full.patch`，sha256 `0d0436af1a1d0085f00c4fb74364a865417b0f880dd94229a7489023ed5c85a0`；
   也可在 `/root/wt-033`（分支 `ple-033`）用 `git diff v0.33.0` 重生。我试过用 Contents API 直接
@@ -329,12 +366,12 @@ CT120 的 `perf.conf` 用 `QWEN_KV_BYTES=10200547328` 把池钉在 9.50 GiB，�
   `systemctl restart qwen38-032-test.service`。本轮已实际走过一次这一路径（§4 的 0.32 对照
   就是这么测的，然后恢复回 0.33），所以回滚是验过的。`/root/vllm-latest`（0.32 臂）全程未改；
   另有备份 `scripts/serve.sh.pre-merged-20261104`、`scripts/serve.sh.pre-spec-switches-20261104`、
-  `scripts/serve.sh.pre-specfn-20261104`（CT103 与 CT120 各有一份）、
-  `zz-v033.conf.pre-kvfp8-20261103`、`/root/n1104/qsa_ops.py.pre-sm80tiles-20261104`。
+  `scripts/serve.sh.pre-specfn-20261104`、`scripts/serve.sh.pre-dlhqhook-20261104`
+  （CT103 与 CT120 各一份）、`zz-v033.conf.pre-kvfp8-20261103`、
+  `/root/n1104/qsa_ops.py.pre-sm80tiles-20261104`。
 - 已知未做：`flashinfer 0.7.2.post1` / `torch 0.29/2.14` 的 pin 没补齐（盘只够一份 CUDA 栈）；
-  `draft_lm_head_quantization` 在 **MTP 臂**（CT120）上没试过——0.33 的 gate 列表里含 mtp，
-  这条臂可能是唯一能吃到它的地方；FLy 同样**只在 DFlash2 臂量过**，CT120 上两行就能试
-  （`Environment=QWEN_REJECTION_METHOD=fly` + `Environment=QWEN_FLY_WINDOW=2`），但需要把卡从
-  CT103 手上换过去，本轮没做；pinned 0.7k–1.3k 那一格多出来的 72 ms 未归因。
+  pinned 0.7k–1.3k 那一格多出来的 72 ms 未归因（§4）；FLy 的“有损”只用 10 题事实探子看过，
+  没有做长文本/代码的分布级对比；`draft_lm_head_quantization` 的 `nvfp4` 档没试（Blackwell 的
+  W4A16 路径，机制上这张卡不可能）。
 - 本轮顺手修了一个坑：CT103 的 `/models` bind 被 01:20 的自动快照流程卸掉后没挂回，
   导致 unit 的 `[Unit] ConditionPathExists` 静默拒绝启动（详见另一篇文档 §4）。
