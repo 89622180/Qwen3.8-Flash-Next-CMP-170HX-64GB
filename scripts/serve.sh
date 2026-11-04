@@ -13,6 +13,23 @@ export VLLM_USE_BREAKABLE_CUDAGRAPH=1
 export HF_HUB_OFFLINE=1
 export CUDA_DEVICE_ORDER=PCI_BUS_ID
 QWEN_MTP=${QWEN_MTP:-1}
+# 0.33 speculative switches, exposed as plain env vars because systemd + JSON
+# quoting is a trap. They ride on ANY drafter, so both speculative branches call
+# this: FLy changes what the verifier accepts, not which draft model runs.
+# The engine warns that FLy is LOSSY -- it is not a quality-neutral knob.
+spec_switches() {
+    local out=""
+    if [[ -n ${QWEN_REJECTION_METHOD:-} ]]; then
+        out+=",\"rejection_sample_method\":\"${QWEN_REJECTION_METHOD}\""
+        if [[ -n ${QWEN_FLY_WINDOW:-} ]]; then
+            out+=",\"fly_window_size\":${QWEN_FLY_WINDOW}"
+        fi
+    fi
+    if [[ -n ${QWEN_LOOKAHEAD_OFF:-} && ${QWEN_LOOKAHEAD_OFF} != 0 ]]; then
+        out+=",\"disable_lookahead_block_hashes\":true"
+    fi
+    printf '%s' "$out"
+}
 spec=()
 if [[ -n ${QWEN_SPEC:-} && ${QWEN_SPEC} == dflash2 ]]; then
     # DFlash2 draft: vLLM dispatches on the draft architecture, and the only
@@ -24,27 +41,16 @@ if [[ -n ${QWEN_SPEC:-} && ${QWEN_SPEC} == dflash2 ]]; then
     # token per step, and its sliding-window group picks a 64-token block that
     # inflates the scheduler LCM. TRITON_ATTN reaches ALWAYS and uses
     # 16-aligned blocks, but refuses fp8 below SM89, hence bf16 for its KV.
-    draft_args=""
+    draft_args="$(spec_switches)"
     if [[ -n ${QWEN_SPEC_ATTN_BACKEND:-} ]]; then
         draft_args+=",\"attention_backend\":\"${QWEN_SPEC_ATTN_BACKEND}\""
     fi
     if [[ -n ${QWEN_SPEC_KV_DTYPE:-} ]]; then
         draft_args+=",\"kv_cache_dtype\":\"${QWEN_SPEC_KV_DTYPE}\""
     fi
-    # 0.33 speculative switches, exposed as plain env vars because systemd + JSON
-    # quoting is a trap. FLy is a LOSSY rejection-sampling variant, not a method.
-    if [[ -n ${QWEN_REJECTION_METHOD:-} ]]; then
-        draft_args+=",\"rejection_sample_method\":\"${QWEN_REJECTION_METHOD}\""
-        if [[ -n ${QWEN_FLY_WINDOW:-} ]]; then
-            draft_args+=",\"fly_window_size\":${QWEN_FLY_WINDOW}"
-        fi
-    fi
-    if [[ -n ${QWEN_LOOKAHEAD_OFF:-} && ${QWEN_LOOKAHEAD_OFF} != 0 ]]; then
-        draft_args+=",\"disable_lookahead_block_hashes\":true"
-    fi
     spec=(--speculative-config "{\"method\":\"dflash\",\"model\":\"${QWEN_SPEC_MODEL:-/models/incoai-Qwen3.8-Flash-Next-DFlash2}\",\"num_speculative_tokens\":${QWEN_SPEC_TOKENS:-7}${draft_args}}")
 elif (( QWEN_MTP > 0 )); then
-    spec=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${QWEN_MTP}}")
+    spec=(--speculative-config "{\"method\":\"mtp\",\"num_speculative_tokens\":${QWEN_MTP}$(spec_switches)}")
 fi
 capture_sizes="${QWEN_CAPTURE_SIZES:-[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,18,20,22,24,26,28,30,32,64,128,256,512,1024,2048]}"
 mode=(--compilation-config "{\"cudagraph_mode\":\"${QWEN_GRAPH_MODE:-FULL_AND_PIECEWISE}\",\"cudagraph_capture_sizes\":${capture_sizes}}")
