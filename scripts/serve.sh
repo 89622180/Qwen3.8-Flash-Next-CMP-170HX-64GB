@@ -28,6 +28,13 @@ spec_switches() {
     if [[ -n ${QWEN_LOOKAHEAD_OFF:-} && ${QWEN_LOOKAHEAD_OFF} != 0 ]]; then
         out+=",\"disable_lookahead_block_hashes\":true"
     fi
+    # Not a CLI flag in 0.33 (`--draft-lm-head-quantization` is "unrecognized
+    # arguments"), so it can only reach the engine through this JSON. The gate in
+    # config/speculative.py:1953 accepts eagle/eagle3/mtp only, and the drafter's
+    # head must run in the model dtype.
+    if [[ -n ${QWEN_DRAFT_LM_HEAD:-} ]]; then
+        out+=",\"draft_lm_head_quantization\":\"${QWEN_DRAFT_LM_HEAD}\""
+    fi
     printf '%s' "$out"
 }
 spec=()
