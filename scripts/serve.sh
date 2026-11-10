@@ -28,6 +28,17 @@ spec_switches() {
     if [[ -n ${QWEN_LOOKAHEAD_OFF:-} && ${QWEN_LOOKAHEAD_OFF} != 0 ]]; then
         out+=",\"disable_lookahead_block_hashes\":true"
     fi
+    # 0.33 gate for mamba_frontier_checkpoint under speculative decoding: both of
+    # these are dataclass fields, not CLI flags (arg_utils has 0 hits), so they only
+    # reach the engine through this JSON. MTP is eagle-family (config/speculative.py
+    # :2131 needs_eagle_block_drop -> use_eagle covers mtp), so the frontier gate
+    # demands both. truncate_acceptance_at_stop also requires Model Runner V2.
+    if [[ -n ${QWEN_TRUNCATE_STOP:-} && ${QWEN_TRUNCATE_STOP} != 0 ]]; then
+        out+=",\"truncate_acceptance_at_stop\":true"
+    fi
+    if [[ -n ${QWEN_NO_EAGLE_DROP:-} && ${QWEN_NO_EAGLE_DROP} != 0 ]]; then
+        out+=",\"disable_eagle_block_drop\":true"
+    fi
     # Not a CLI flag in 0.33 (`--draft-lm-head-quantization` is "unrecognized
     # arguments"), so it can only reach the engine through this JSON. The gate in
     # config/speculative.py:1953 accepts eagle/eagle3/mtp only, and the drafter's
