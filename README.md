@@ -5,6 +5,7 @@
 本文记录 2026-10-10 一天之内的调优全过程：冷 prefill 从 ~3,550 → ~3,500+（32k）、**200k 长上下文从 2,264 → ~3,525 tok/s（+56 %）、TTFT 从 88.5 s → ~56.5 s**，以及每一个被否决的方案（诚实版）。
 2026-10-14 第二轮（chunk 上探 8K/16K、显存天花板 0.983、同日四配置 A/B）见第 8 节——**最终配置改为 chunk 2048 / util 0.99**（同日全指标最优，KV 池 393,940）。
 2026-10-22/23 第三轮（PLE 行缓存大小矩阵、预取 limit 公式 90% 放宽、ARC 降 2G、recordsize 论证、util 0.995）见第 9 节——**最终配置 cache 2048 MiB / prefetch 262144 / util 0.995（KV 池 405,526）**。
+2026-11-14 第四轮（chunk 8192→2048 复测、300 W 对齐、HBM 1890 MHz 单卡实测）见第 13 节——**chunk 回到 2048（8k prefill −35 %、KV +10.5 %），HBM 1890 无收益、保持默认 NDIV=64**。
 
 ## 对比一览：作者原版 vs 本仓库最终
 
@@ -679,3 +680,81 @@ Environment=VLLM_SW_BLOCK_SIZE=1072
 
 > draft KV 保持 bf16：Triton 在 SM89 以下拒绝 fp8 KV；FlashInfer 的 page_size≤64
 > 在 sm80 有池塌陷（11.5 的根因），不可修。
+
+## 13. 第四轮调优实录（2026-11-14）：chunk 8192→2048、300 W 对齐与 HBM 1890 MHz
+
+### 13.1 口径
+
+同卡、同模型（`Qwen3.8-Flash-Next-Uncensored-AutoRound-3bpw-MTP` + DFlash2 `W8A16G128-GPTQ` 草稿）、
+同固定脚本（单流 1 token 取 TTFT 的并发探针 + 512 提示 / 256 输出且 `ignore_eos` 的 decode 探针，
+两者都直接打 `/v1/completions`，脚本在 CT103 的 `/root/bench_conc.py`、`/root/bench_conc_text.py`）。
+serving GPU = `07:00.0`（`nvidia-smi` index 1），限 300 W（= `power.max_limit`）；KV 用
+`--kv-cache-memory-bytes 11542724608`（10.75 GiB），capture list 不含 2048 桶（第 10 节口径）。
+
+本轮只动两个变量：`QWEN_BATCH_TOKENS`（8192 → 2048）与 HBM 档位（`RmHbmPllNdiv` 64 → 70，只给 `07:00.0`）。
+
+三个实验臂：**A** = 默认 HBM + chunk 2048（同一次开机，改 drop-in 重启引擎）；
+**B** = NDIV 70 + chunk 2048（改 modprobe 后整机重启）；**C** = 回到默认 NDIV 64 + chunk 2048（再整机重启）。
+B/C 用来剥离「整机重启」这个变量，因为本机跨开机本身有 ~5 % 的系统偏移（见 13.3）。
+
+### 13.2 chunk 8192 → 2048（A 臂内单变量，同一次开机、同一个 KV 预算）
+
+| pin | chunk 8192 | chunk 2048 | 变化 |
+|---|---:|---:|---:|
+| 512 | 0.338 s | 0.248 s | −27 % |
+| 2,048 | 0.907 s | 0.802–0.815 s | −11 % |
+| 8,192 | 3.93–4.06 s | **2.608–2.636 s** | **−35 %** |
+| 32,768 | 11.10 s | 9.53–9.59 s | −14 % |
+| 131,072 | 40.15 s | 38.70 s | −3.6 % |
+
+- KV 池 570,059 → **630,065** tok（+10.5 %；同一份 `QWEN_KV_BYTES` 下块对齐随 chunk 变化，白捡）
+- decode（512 提示 / 256 输出）：C1 177–194、C4 449–461、C8 625–679 tok/s，与 chunk 8192 在噪声内一致
+- **8k 那个台阶不是 capture 桶造成的**（第 10 节的 `[1..1024]` 列表已经把 2048 桶去掉），它是 chunk 边界本身：
+  8192 恰好一整块，同样的 8192 token 切成 4×2048 只要 2.6 s。机制尚未归因（PLE AIO 深度与 attention 分块都是嫌疑），
+  但两次同日测试（17:59 与 18:19）都复现，且 2k/32k 同向受益
+- 结论：8–32k 段白拿 14–35 %，长上下文不亏（131k −3.6 %）。drop-in 见 `configs/zz-chunk2048.conf`（单页实录见 `docs/round4-2026-11-14-chunk2048-hbm1890.md`）
+
+### 13.3 HBM NDIV=70 / 1890 MHz（只给 07:00.0）
+
+```ini
+# /etc/modprobe.d/90-cmp-vbios-override.conf
+options nvidia NVreg_RegistryDwordsPerDevice="pci=0000:01:00.0;RmLinuxVbiosOverride=2;RmLinuxVbiosOverrideSize=393216;RmHbmPllNdiv=64;pci=0000:07:00.0;RmHbmPllNdiv=70"
+options nvidia NVreg_RegistryBinaryFilePerDevice="pci=0000:01:00.0;RmLinuxVbiosOverrideImage=615.71.09/vbios-override/vbios.bin"
+```
+
+生效证据：`dmesg | grep HBMPLL_OC` 出现 `done, 8 FBPAs at NDIV=70 (1890 MHz)`；
+`nvidia-smi --query-gpu=index,pci.bus_id,clocks.mem` 为 `07:00.0 = 1890 MHz` / `01:00.0 = 1728 MHz`（默认卡不受影响）。
+
+> 两个坑：① 内核日志的 `GPU0/GPU1` 编号与 `nvidia-smi` 索引**相反**（本次 `dmesg` 的 `GPU0` 就是 `07:00.0`），
+> 核对一律按 PCI 地址；② `modprobe -r nvidia` 在 `dsh-console` 持有 `/dev/nvidia*` 时会被拒（rc=1），
+> 所以换 HBM 档位只能整机重启。
+
+结果（每格同一引擎连续 2–3 次；B/C 各在开机后 ~6 min 测一轮、~10 min 再复测一轮）：
+
+| pin | 1728 MHz（C 臂） | 1890 MHz（B 臂） |
+|---|---:|---:|
+| 8,192 | 2.96–3.05 s；暖机 2.75–2.89 s | 3.09–3.24 s；暖机 2.78–2.80 s |
+| 16,384 | 6.92 s；暖机 5.18 s | 5.61 s |
+| 32,768 | 10.73–10.85 s；暖机 10.23–11.52 s | 10.36–11.58 s；暖机 10.26 s |
+| 131,072 | 43.98 s | 41.43 s |
+| decode C8 聚合 | 630–639 tok/s | 629–652 tok/s |
+
+结论：**没有收益**。暖机后 8k 两边都是 2.78–2.80 s；32k/128k 的差异方向互相打架，
+而同臂 run-to-run 本身有 5–14 %（32k/128k 最不稳），跨整机重启还有 ~5 % 的系统偏移
+（A 臂 8k 2.61–2.64 s 与 C 臂同一份配置 2.75–2.89 s 的差）。11-09 的纯带宽微测是
+1728 → 1598 GB/s、1890 → 1773 GB/s（+11 %），但这条管线里 prefill 的瓶颈在 PLE SSD 路径
+（45–65k IOPS / 200–300 MB/s 持续读）与 SM 侧计算，HBM 带宽兑换不出来。**保持默认 NDIV=64。**
+
+两侧都是 300 W、SM 1455 MHz、HBM 温度 66–67 °C、throttle 标志为 0（仅一次 0x4 采样），所以不是功耗/温度/节流假象。
+
+### 13.4 300 W 对齐
+
+把 `07:00.0` 从 180 W 提到 300 W 后重测，与第 4 节「250 → 300 W 吞吐变化为零」一致：
+本工作负载在 180–300 W 区间内不撞功耗墙（实测峰值 303–332 W 的瞬时尖峰，SM 稳定 1455 MHz）。
+功率上限属于机主策略项，测试结束后已回到 180 W。
+
+### 13.5 本轮最终配置
+
+- `QWEN_BATCH_TOKENS=2048`（`configs/zz-chunk2048.conf`，装到 `qwen38-032-test.service.d/zz-chunk2048.conf`）
+- `QWEN_KV_BYTES=11542724608`（10.75 GiB → 630,065 tok；`scripts/serve.sh` 透传 `--kv-cache-memory-bytes`）
+- HBM 保持默认 NDIV=64 / 1728 MHz；功耗上限按机主策略设定
